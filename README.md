@@ -38,7 +38,8 @@ surface (video renders *inside* the app - no separate VLC window popping up).
 - **Sleek controls** - play/pause, volume, fullscreen - with a red **LIVE** badge.
 - **Video-only fullscreen** - `F11`, the button, or **double-click** the video (double-click again to exit).
 - **Keyboard driven** - `Space` play/pause, `M` mute, `F` fullscreen, `Up`/`Down` volume.
-- **First-run wizard** + connection **pill** and a settings dialog; credentials are remembered.
+- **First-run wizard** + connection **pill** and a settings **window**; credentials are remembered.
+- **Identity is set once** - in the wizard, or changed deliberately in settings. There is nothing to switch mid-session.
 - **Who's watching** - see which of your friends is on the shared account, what they're watching, and whether the connection limit is about to bite.
 - **CLI mode** for scripting (`categories`, `list`, `url`, `m3u`, `epg`).
 - Clean dark theme, no clutter.
@@ -151,7 +152,7 @@ worker within ~3 minutes if the app is killed.
 
 ### Setup
 
-Paste the worker URL and shared token into the settings dialog, or add them to
+Paste the worker URL and shared token into the settings window (the gear, top right), or add them to
 `%APPDATA%\EagleGlass\config.txt`:
 
 ```ini
@@ -178,6 +179,7 @@ each one consumes a connection.
 | `EG_PROFILE` | Override who is watching, e.g. `Peter`. |
 | `EG_PRESENCE_URL` / `EG_PRESENCE_TOKEN` | Override the presence worker and its shared token. |
 | `EG_AUTOPLAY` | Stream id to auto-play once the Live list loads. |
+| `EG_SETTINGS` | Open the settings window at launch (handy for scripting and screenshots). |
 | `EG_VLC_DIR` | Folder containing `libvlc.dll` (defaults to the installed VLC). |
 
 ## CLI
@@ -196,8 +198,10 @@ eglass.exe epg
 `src/video.rs` loads `libvlc.dll` at runtime (via [`libloading`](https://crates.io/crates/libloading)),
 creates a child Win32 window inside the app window, and points libVLC at it with
 `libvlc_media_player_set_hwnd`. The child window is repositioned every frame to match the `egui`
-video rectangle. Because that surface is a native child window, `egui` can't paint over it - so the
-control bar sits directly beneath the video, and the settings dialog temporarily hides the video while open.
+video rectangle. Because that surface is a native child window, `egui` can't paint over it - which is
+why the settings form lives in its **own top-level window** rather than a dialog drawn inside the app,
+and why the pre-play guard still shrinks the video away while it is on screen (nothing is playing at
+that point, so there is nothing to interrupt).
 
 ## Project layout
 

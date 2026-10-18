@@ -751,7 +751,7 @@ impl Default for App {
             open_cats: std::collections::HashSet::new(),
             now_playing: String::new(),
             playing_id: String::new(),
-            show_settings: false,
+            show_settings: std::env::var("EG_SETTINGS").is_ok(),
             wizard: !autostart,
             vol_reapply: 0,
             prev_lbtn: false,
@@ -1120,8 +1120,8 @@ impl App {
                 "Pick who's watching"
             };
             pill_resp(ui, T_MUTED, hint).on_hover_text(
-                "Set presence_url, presence_token and profile in %APPDATA%\\EagleGlass\\config.txt \
-                 (or EG_PRESENCE_URL / EG_PRESENCE_TOKEN / EG_PROFILE) to see who else is on the account.",
+                "Set presence_url, presence_token and profile in the settings window \
+                 (the gear, top right) - or in %APPDATA%\\EagleGlass\\config.txt.",
             );
             return;
         }
@@ -1198,13 +1198,10 @@ impl App {
         }
     }
 
-    /// Top bar identity control: who is watching, and who else is on.
+    /// Top bar: who else is on the line. Identity itself is deliberately *not*
+    /// here - it is set once in the wizard and changed only from Settings, since
+    /// there is no reason to switch who you are mid-session.
     fn presence_top_ui(&mut self, ui: &mut egui::Ui) {
-        let list = self.profiles.clone();
-        if !list.is_empty() {
-            ui.label(egui::RichText::new("Watching as").size(11.0).color(T_MUTED));
-            self.profile_combo(ui, "profile_top", 96.0);
-        }
         self.presence_pill_ui(ui);
     }
 
@@ -1880,146 +1877,165 @@ impl eframe::App for App {
 
         if self.show_settings {
             let m = egui::Margin::symmetric(6.0, 5.0);
-            let mut open = true;
-            egui::Window::new("Settings")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_width(320.0);
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("Server").size(11.0).color(T_MUTED));
-                    ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(320.0).margin(m));
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Username").size(11.0).color(T_MUTED));
-                    ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(320.0).margin(m));
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Password").size(11.0).color(T_MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pass)
-                            .desired_width(320.0)
-                            .password(true)
-                            .margin(m),
-                    );
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Live format").size(11.0).color(T_MUTED));
-                        egui::ComboBox::from_id_source("fmt")
-                            .width(80.0)
-                            .selected_text(self.live_format.clone())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.live_format, "ts".into(), "ts");
-                                ui.selectable_value(&mut self.live_format, "m3u8".into(), "m3u8");
+            let mut close = false;
+            // Its own top-level window, so it does not sit on the native libVLC
+            // surface - painting over that is impossible, and hiding the video to
+            // work around it is what stopped playback.
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("eglass-settings"),
+                egui::ViewportBuilder::default()
+                    .with_title("Eagle Glass - Settings")
+                    .with_inner_size([380.0, 660.0])
+                    .with_min_inner_size([340.0, 480.0]),
+                |ui_ctx, _class| {
+                    // The X button. eframe pushes ViewportEvent::Close for child
+                    // viewports, and it is on us to stop showing it - verified by
+                    // posting WM_CLOSE at the window.
+                    if ui_ctx.input(|i| i.viewport().close_requested()) {
+                        close = true;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::none()
+                                .fill(T_BG)
+                                .inner_margin(egui::Margin::same(14.0)),
+                        )
+                        .show(ui_ctx, |ui| {
+                            ui.set_width(320.0);
+                            ui.add_space(2.0);
+                            ui.label(egui::RichText::new("Server").size(11.0).color(T_MUTED));
+                            ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(320.0).margin(m));
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Username").size(11.0).color(T_MUTED));
+                            ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(320.0).margin(m));
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Password").size(11.0).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pass)
+                                    .desired_width(320.0)
+                                    .password(true)
+                                    .margin(m),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Live format").size(11.0).color(T_MUTED));
+                                egui::ComboBox::from_id_source("fmt")
+                                    .width(80.0)
+                                    .selected_text(self.live_format.clone())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.live_format, "ts".into(), "ts");
+                                        ui.selectable_value(&mut self.live_format, "m3u8".into(), "m3u8");
+                                    });
                             });
-                    });
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Picture (fix washed-out UHD / HDR)")
-                            .size(10.5)
-                            .color(T_MUTED),
-                    );
-                    ui.add_space(4.0);
-                    ui.spacing_mut().slider_width = 170.0;
-                    let mut changed = false;
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [72.0, 18.0],
-                            egui::Label::new(egui::RichText::new("Brightness").size(11.0)),
-                        );
-                        changed |= ui.add(egui::Slider::new(&mut self.bright, 0.5..=2.0)).changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [72.0, 18.0],
-                            egui::Label::new(egui::RichText::new("Contrast").size(11.0)),
-                        );
-                        changed |= ui.add(egui::Slider::new(&mut self.contrast, 0.5..=2.0)).changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [72.0, 18.0],
-                            egui::Label::new(egui::RichText::new("Gamma").size(11.0)),
-                        );
-                        changed |= ui.add(egui::Slider::new(&mut self.gamma, 0.5..=3.0)).changed();
-                    });
-                    if ui.button("Reset picture").clicked() {
-                        self.bright = 1.0;
-                        self.contrast = 1.0;
-                        self.gamma = 1.0;
-                        changed = true;
-                    }
-                    if changed {
-                        self.player.set_picture(self.bright, self.contrast, self.gamma);
-                    }
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Presence — who else is on this line")
-                            .size(10.5)
-                            .color(T_MUTED),
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Watching as").size(11.0).color(T_MUTED));
-                        self.profile_combo(ui, "profile_settings", 150.0);
-                    });
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Presence URL").size(11.0).color(T_MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.presence_url)
-                            .desired_width(320.0)
-                            .margin(m)
-                            .hint_text("https://eglass-presence.<sub>.workers.dev"),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Presence token").size(11.0).color(T_MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.presence_token)
-                            .desired_width(320.0)
-                            .password(true)
-                            .margin(m),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let url = self.dashboard_url();
-                        ui.add_enabled_ui(!url.is_empty(), |ui| {
-                            if ui.button("Open dashboard").clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Picture (fix washed-out UHD / HDR)")
+                                    .size(10.5)
+                                    .color(T_MUTED),
+                            );
+                            ui.add_space(4.0);
+                            ui.spacing_mut().slider_width = 170.0;
+                            let mut changed = false;
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [72.0, 18.0],
+                                    egui::Label::new(egui::RichText::new("Brightness").size(11.0)),
+                                );
+                                changed |= ui.add(egui::Slider::new(&mut self.bright, 0.5..=2.0)).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [72.0, 18.0],
+                                    egui::Label::new(egui::RichText::new("Contrast").size(11.0)),
+                                );
+                                changed |= ui.add(egui::Slider::new(&mut self.contrast, 0.5..=2.0)).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [72.0, 18.0],
+                                    egui::Label::new(egui::RichText::new("Gamma").size(11.0)),
+                                );
+                                changed |= ui.add(egui::Slider::new(&mut self.gamma, 0.5..=3.0)).changed();
+                            });
+                            if ui.button("Reset picture").clicked() {
+                                self.bright = 1.0;
+                                self.contrast = 1.0;
+                                self.gamma = 1.0;
+                                changed = true;
+                            }
+                            if changed {
+                                self.player.set_picture(self.bright, self.contrast, self.gamma);
+                            }
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Presence — who else is on this line")
+                                    .size(10.5)
+                                    .color(T_MUTED),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Watching as").size(11.0).color(T_MUTED));
+                                self.profile_combo(ui, "profile_settings", 150.0);
+                            });
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Presence URL").size(11.0).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.presence_url)
+                                    .desired_width(320.0)
+                                    .margin(m)
+                                    .hint_text("https://eglass-presence.<sub>.workers.dev"),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Presence token").size(11.0).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.presence_token)
+                                    .desired_width(320.0)
+                                    .password(true)
+                                    .margin(m),
+                            );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let url = self.dashboard_url();
+                                ui.add_enabled_ui(!url.is_empty(), |ui| {
+                                    if ui.button("Open dashboard").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                                    }
+                                });
+                                if ui.button("Refresh").clicked() {
+                                    if let Ok(mut g) = self.shared.lock() {
+                                        g.force_poll = true;
+                                    }
+                                }
+                            });
+                            if !self.presence_ready() {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "Pick a name and fill in both presence fields to see the others.",
+                                        )
+                                        .size(10.5)
+                                        .color(T_MUTED),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            ui.add_space(12.0);
+                            let connecting = self.rx.is_some();
+                            let label = if connecting { "Connecting..." } else { "Connect" };
+                            if ui.add_sized([320.0, 30.0], egui::Button::new(label)).clicked() && !connecting {
+                                save_config(&self.config_snapshot());
+                                self.spawn_login();
+                                self.show_settings = false;
                             }
                         });
-                        if ui.button("Refresh").clicked() {
-                            if let Ok(mut g) = self.shared.lock() {
-                                g.force_poll = true;
-                            }
-                        }
-                    });
-                    if !self.presence_ready() {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(
-                                    "Pick a name and fill in both presence fields to see the others.",
-                                )
-                                .size(10.5)
-                                .color(T_MUTED),
-                            )
-                            .wrap(),
-                        );
-                    }
-                    ui.add_space(12.0);
-                    let connecting = self.rx.is_some();
-                    let label = if connecting { "Connecting..." } else { "Connect" };
-                    if ui.add_sized([320.0, 30.0], egui::Button::new(label)).clicked() && !connecting {
-                        save_config(&self.config_snapshot());
-                        self.spawn_login();
-                        self.show_settings = false;
-                    }
-                });
-            if !open {
+                },
+            );
+            if close {
                 self.show_settings = false;
             }
         }
