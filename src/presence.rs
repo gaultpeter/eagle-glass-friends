@@ -25,7 +25,7 @@ pub const DEFAULT_PROFILES: [(&str, &str); 4] = [
     ("panda", "Panda"),
 ];
 
-const HEARTBEAT_MS: i64 = 60_000;
+const HEARTBEAT_MS: i64 = 90_000;
 const POLL_ACTIVE_MS: i64 = 20_000;
 const POLL_IDLE_MS: i64 = 60_000;
 /// How often to re-read `active_cons` / `max_connections` from the panel.
@@ -100,15 +100,25 @@ pub struct Shared {
     pub stale_profile: String,
     /// Set by the "Refresh" button to pull the roster on the next tick.
     pub force_poll: bool,
+    /// Set when a stream starts, so `active_cons` is re-read from the panel
+    /// straight away. Otherwise the reported count is up to a minute stale -
+    /// and right after you press play it still says 0, because that reading
+    /// predates your own stream.
+    pub force_account: bool,
 
     pub shutdown: bool,
 }
 
 impl Shared {
+    /// What counts as "a different thing to report". Deliberately excludes
+    /// `state`: libVLC reports not-playing while it buffers, so including it made
+    /// the signature flap and roughly doubled the heartbeat rate (and therefore
+    /// the KV write cost). Pausing is cosmetic - the connection is held either
+    /// way - so it can wait for the next timed beat.
     pub fn signature(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
-            self.profile, self.state, self.stream_kind, self.stream_id, self.stream_name
+            "{}|{}|{}|{}",
+            self.profile, self.stream_kind, self.stream_id, self.stream_name
         )
     }
 }
@@ -154,8 +164,10 @@ impl Roster {
         self.watchers.iter().filter(|w| w.profile != me).collect()
     }
 
-    pub fn my_devices(&self, me: &str) -> i64 {
-        self.watchers.iter().filter(|w| w.profile == me).count() as i64
+    /// Whether we are the ones holding the line. The worker keeps one entry per
+    /// person, so this is a flag rather than a count.
+    pub fn mine(&self, me: &str) -> bool {
+        self.watchers.iter().any(|w| w.profile == me)
     }
 }
 
@@ -370,6 +382,12 @@ fn run(shared: Arc<Mutex<Shared>>, roster: Arc<Mutex<Roster>>) {
             last_heartbeat = 0;
             if let Ok(mut g) = shared.lock() {
                 g.force_poll = false;
+            }
+        }
+        if snap.force_account {
+            last_account = 0;
+            if let Ok(mut g) = shared.lock() {
+                g.force_account = false;
             }
         }
 

@@ -108,14 +108,20 @@ the line is free) and the worker for the roster (the authority on *who*). Then:
 | Panel says | You see |
 |---|---|
 | Free | Nothing. The stream just starts - the common case stays zero-friction. |
-| Busy, a friend is on | *"Blain is watching Sky Sports Main Event · 38m in. This line allows 1 connection. Starting will kick them off."* with **Cancel** / **Take the line**. |
-| Busy, nobody checked in | *"Someone is watching that we can't identify."* |
+| Busy, a friend is checked in | *"Blain is watching Sky Sports Main Event · 38m in. This line allows 1 connection. Starting will kick them off."* with **Cancel** / **Take the line**. |
 | Busy, only your own other device | *"You're already watching on another device."* |
+| Busy, nobody checked in | Nothing blocks. You get a status note: *"Panel reports 1/1 in use with nobody checked in - taking the line."* |
+
+That last row is deliberate. The panel's `active_cons` is only a hint: measured
+against a real panel it stayed at 1 for over four minutes with nothing running at
+all, because the counter is slow to clear. A dialog on that reading would fire on
+every single play attempt. The rule is therefore narrow - **stop only when we can
+name somebody we would displace** - which also means a stranger's connection costs
+you nothing but a note, and they were not authorised anyway.
 
 Once a stream is up you hold the connection, so zapping channels never re-prompts.
 
-If the worker is unreachable the panel still knows the line is busy, so you get the warning without a
-name rather than nothing at all.
+If the worker cannot be reached the guard does not invent a warning: it plays.
 
 ### The pill
 
@@ -139,7 +145,7 @@ If your stream stops and you did not pause it, the app asks for a fresh roster a
 the line: *"Blain took the line - now on Sky Sports Main Event"*. It would be poor form to let your
 stream die unexplained. A pause is treated as deliberate, so pausing never triggers this.
 
-While a stream is up the app heartbeats the worker every 60s. A paused stream still holds a panel
+While a stream is up the app heartbeats the worker every 90s. A paused stream still holds a panel
 connection, so pausing keeps you on the roster. Presence clears when you exit, and self-expires on the
 worker within ~3 minutes if the app is killed.
 
@@ -218,7 +224,8 @@ control bar sits directly beneath the video, and the settings dialog temporarily
   other, you both see "free" and one of you gets cut. A short claim on the worker would shrink that
   window but not close it.
 - The roster refreshes every 20s while you are watching and every 60s while idle; heartbeats are
-  written every 60s to stay inside Cloudflare KV's free write allowance.
+  written every 90s to stay inside Cloudflare KV's free write allowance (measured at 48 writes and
+  960 reads per hour of watching, with zero list calls - see the worker's README for the budget).
 - `cargo test` covers the guard's decision logic and the pill's wording, including the one-connection
   cases - those are pure functions precisely so they can be tested without a window or a panel.
 

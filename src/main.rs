@@ -421,9 +421,9 @@ struct Msg {
     items: Option<Vec<Item>>,
     play: Option<String>,
     error: Option<String>,
-    /// Set when the pre-play guard found the line already in use. The URL is
-    /// still in `play`; the UI holds it until the user decides.
-    conflict: Option<Conflict>,
+    /// Set when the pre-play guard has something to say. The URL is still in
+    /// `play`; the UI decides whether to hold it.
+    guard: Option<GuardOutcome>,
 }
 
 /// Someone else is holding the connection.
@@ -445,9 +445,18 @@ impl Conflict {
 /// A resolved stream URL waiting on the user's answer to the guard.
 struct PendingPlay {
     url: String,
-    kind: Kind,
-    name: String,
     conflict: Conflict,
+}
+
+/// What the guard decided to do about the line being busy.
+#[derive(Clone)]
+enum GuardOutcome {
+    /// Nothing worth saying - go ahead.
+    Free,
+    /// Stop and ask, because we know exactly who would be displaced.
+    Warn(Conflict),
+    /// Go ahead, but say something in the status bar.
+    Proceed { note: String },
 }
 
 /// Everything the guard thread needs to ask "is the line free, and who has it".
@@ -461,13 +470,20 @@ struct GuardContext {
 }
 
 impl GuardContext {
-    fn check(&self) -> Option<Conflict> {
-        // The panel is the authority: `active_cons` is not an estimate.
-        let (active, max_connections) = probe_panel(&self.server, &self.user, &self.pass).ok()?;
+    fn check(&self) -> GuardOutcome {
+        // The panel is the authority on *whether* the line is busy, but its
+        // counter is only a hint: it is slow to clear. Measured against a real
+        // panel, active_cons stayed at 1 for over four minutes with nothing of
+        // ours running at all.
+        let counts = probe_panel(&self.server, &self.user, &self.pass).ok();
         let roster = presence::Presence::new(&self.presence_url, &self.presence_token)
             .roster()
             .ok();
-        decide_guard(active, max_connections, roster.as_ref(), &self.profile)
+        match counts {
+            Some((active, max)) => decide_guard(active, max, roster.as_ref(), &self.profile),
+            // We could not ask. Do not invent a warning out of a failed request.
+            None => GuardOutcome::Free,
+        }
     }
 }
 
@@ -482,45 +498,59 @@ fn probe_panel(
     Ok(presence::account_counts(&info))
 }
 
-/// Should we warn before taking the line? Pure, so it can be tested without a
+/// Should we stop before taking the line? Pure, so it can be tested without a
 /// panel or a window.
 ///
-/// `active_cons` from the panel decides *whether* the line is busy; the roster
-/// only decides *who* to name. A failure to reach the worker therefore still
-/// produces a warning, just an unattributed one.
+/// Deliberately narrow: only stop when we can *name* somebody we would displace.
+/// A nonzero `active_cons` with nobody checked in is ambiguous - it may be a
+/// watcher we cannot see, or the panel's counter lagging behind a stream that
+/// already ended - and a modal firing on that ambiguity would nag the user every
+/// single time they pressed play, for as long as the counter stuck.
 fn decide_guard(
     active_cons: i64,
     max_connections: i64,
     roster: Option<&Roster>,
     my_profile: &str,
-) -> Option<Conflict> {
+) -> GuardOutcome {
     if active_cons <= 0 {
-        // Line is free - no dialog, no added friction.
-        return None;
+        return GuardOutcome::Free;
     }
 
-    let (who, stream, minutes) = match roster {
-        Some(r) => {
-            // The roster arrives freshest-first.
-            match r.watchers.iter().find(|w| w.profile != my_profile) {
-                Some(w) => (w.name.clone(), w.stream_name.clone(), w.watching_seconds / 60),
-                // A connection is live but every checked-in device is ours, so
-                // it is almost certainly another device of ours holding it.
-                None if r.watchers.iter().any(|w| w.profile == my_profile) => {
-                    ("You (another device)".to_string(), String::new(), 0)
-                }
-                None => (String::new(), String::new(), 0),
-            }
-        }
-        None => (String::new(), String::new(), 0),
-    };
+    let mine = roster.map(|r| r.mine(my_profile)).unwrap_or(false);
+    let other = roster.and_then(|r| r.others(my_profile).into_iter().next().cloned());
 
-    Some(Conflict {
-        who,
-        stream,
-        minutes,
-        max_connections,
-    })
+    if let Some(w) = other {
+        // A friend is on the line, so we know exactly who gets cut.
+        return GuardOutcome::Warn(Conflict {
+            who: w.name.clone(),
+            stream: w.stream_name.clone(),
+            minutes: w.watching_seconds / 60,
+            max_connections,
+        });
+    }
+
+    if mine {
+        return GuardOutcome::Warn(Conflict {
+            who: "You (another device)".to_string(),
+            stream: String::new(),
+            minutes: 0,
+            max_connections,
+        });
+    }
+
+    // A connection is counted but nobody of ours claims one. Take it, and say so
+    // in the status bar rather than blocking on it.
+    GuardOutcome::Proceed {
+        note: format!(
+            "Panel reports {}/{} in use with nobody checked in - taking the line",
+            active_cons,
+            if max_connections > 0 {
+                max_connections.to_string()
+            } else {
+                "?".to_string()
+            }
+        ),
+    }
 }
 
 struct App {
@@ -583,6 +613,10 @@ struct App {
     paused_by_user: bool,
     /// Non-zero while a drop is being attributed to whoever took the line.
     drop_at: i64,
+    /// What was on disk at startup, so env-overridden settings can be kept out
+    /// of the file when we save.
+    file_cfg: Config,
+    env: EnvOverrides,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -596,35 +630,70 @@ fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
     })
 }
 
+/// Which settings arrived from the environment this run.
+///
+/// These are per-run overrides and must never be written back to config.txt,
+/// or an override quietly becomes permanent. Every save path has to respect
+/// this, not just startup: the first version only guarded the device-id
+/// bootstrap, so a successful login wrote EG_PRESENCE_URL and the token into
+/// the file anyway.
+#[derive(Default, Clone, Copy)]
+struct EnvOverrides {
+    server: bool,
+    user: bool,
+    pass: bool,
+    format: bool,
+    profile: bool,
+    presence_url: bool,
+    presence_token: bool,
+}
+
 impl Default for App {
     fn default() -> Self {
         let mut cfg = load_config();
 
-        // Env overrides win, matching EG_SERVER / EG_USER / EG_PASS.
-        let env_or = |key: &str, fallback: &str| -> String {
-            std::env::var(key)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback.to_string())
+        let env_val = |key: &str| std::env::var(key).ok().filter(|s| !s.is_empty());
+        let user_env = env_val("EG_USER");
+        let pass_env = env_val("EG_PASS");
+        let server_env = env_val("EG_SERVER");
+        let format_env = env_val("EG_FORMAT");
+        let profile_env = env_val("EG_PROFILE");
+        let url_env = env_val("EG_PRESENCE_URL");
+        let token_env = env_val("EG_PRESENCE_TOKEN");
+
+        let overrides = EnvOverrides {
+            server: server_env.is_some(),
+            user: user_env.is_some(),
+            pass: pass_env.is_some(),
+            format: format_env.is_some(),
+            profile: profile_env.is_some(),
+            presence_url: url_env.is_some(),
+            presence_token: token_env.is_some(),
         };
-        let user = env_or("EG_USER", &cfg.user);
-        let pass = env_or("EG_PASS", &cfg.pass);
-        let server = env_or(
-            "EG_SERVER",
-            if cfg.server.is_empty() { DEFAULT_SERVER } else { &cfg.server },
-        );
-        let live_format = env_or("EG_FORMAT", if cfg.format.is_empty() { "ts" } else { &cfg.format });
-        let profile = env_or("EG_PROFILE", &cfg.profile);
-        let presence_url = env_or("EG_PRESENCE_URL", &cfg.presence_url);
-        let presence_token = env_or("EG_PRESENCE_TOKEN", &cfg.presence_token);
+
+        let user = user_env.unwrap_or_else(|| cfg.user.clone());
+        let pass = pass_env.unwrap_or_else(|| cfg.pass.clone());
+        let server = server_env.unwrap_or_else(|| {
+            if cfg.server.is_empty() {
+                DEFAULT_SERVER.to_string()
+            } else {
+                cfg.server.clone()
+            }
+        });
+        let live_format = format_env.unwrap_or_else(|| {
+            if cfg.format.is_empty() {
+                "ts".to_string()
+            } else {
+                cfg.format.clone()
+            }
+        });
+        let profile = profile_env.unwrap_or_else(|| cfg.profile.clone());
+        let presence_url = url_env.unwrap_or_else(|| cfg.presence_url.clone());
+        let presence_token = token_env.unwrap_or_else(|| cfg.presence_token.clone());
 
         // A device id must survive restarts: it is the KV key suffix, so a new
         // one every launch would leave ghost entries in the roster for a full
         // TTL. Generated once, then persisted.
-        //
-        // Note that only the generated id is written back here. Environment
-        // variables are per-run overrides and are deliberately not persisted -
-        // the config file holds what the wizard and settings dialog saved.
         let device_id = if cfg.device_id.is_empty() {
             let id = presence::new_device_id();
             cfg.device_id = id.clone();
@@ -633,6 +702,7 @@ impl Default for App {
         } else {
             cfg.device_id.clone()
         };
+        let file_cfg = cfg;
 
         let autostart = !user.is_empty() && !pass.is_empty();
 
@@ -699,6 +769,8 @@ impl Default for App {
             play_started_at: 0,
             paused_by_user: false,
             drop_at: 0,
+            file_cfg,
+            env: overrides,
         }
     }
 }
@@ -797,7 +869,7 @@ impl App {
             match client.play_url(kind, &item, &fmt) {
                 Ok(url) => {
                     if let Some(ctx) = guard {
-                        msg.conflict = ctx.check();
+                        msg.guard = Some(ctx.check());
                     }
                     msg.play = Some(url);
                 }
@@ -841,17 +913,18 @@ impl App {
                 }
             }
             if let Some(url) = msg.play {
-                if let Some(conflict) = msg.conflict {
-                    // Hold the URL and ask. Nothing has touched the panel yet.
-                    self.status = format!("{} is on the line", describe_conflict(&conflict));
-                    self.pending_play = Some(PendingPlay {
-                        url,
-                        kind: self.kind,
-                        name: self.now_playing.clone(),
-                        conflict,
-                    });
-                } else {
-                    self.start_stream(url);
+                match msg.guard {
+                    // Somebody we can name would be displaced: hold the URL and ask.
+                    Some(GuardOutcome::Warn(conflict)) => {
+                        self.status = format!("{} is on the line", describe_conflict(&conflict));
+                        self.pending_play = Some(PendingPlay { url, conflict });
+                    }
+                    // Nobody to displace - play, but say what the panel claimed.
+                    Some(GuardOutcome::Proceed { note }) => {
+                        self.start_stream(url);
+                        self.status = note;
+                    }
+                    _ => self.start_stream(url),
                 }
             }
             if let Some(e) = msg.error {
@@ -866,16 +939,34 @@ impl App {
     /* --------------------------------------------------------- presence ---- */
 
     /// The on-disk representation, built from current UI state.
+    ///
+    /// Anything that came from the environment keeps the value that was
+    /// already on disk, so an override never becomes permanent.
     fn config_snapshot(&self) -> Config {
+        let keep = |from_env: bool, live: &str, on_disk: &str| -> String {
+            if from_env {
+                on_disk.to_string()
+            } else {
+                live.to_string()
+            }
+        };
         Config {
-            server: self.server.clone(),
-            user: self.user.clone(),
-            pass: self.pass.clone(),
-            format: self.live_format.clone(),
-            profile: self.profile.clone(),
+            server: keep(self.env.server, &self.server, &self.file_cfg.server),
+            user: keep(self.env.user, &self.user, &self.file_cfg.user),
+            pass: keep(self.env.pass, &self.pass, &self.file_cfg.pass),
+            format: keep(self.env.format, &self.live_format, &self.file_cfg.format),
+            profile: keep(self.env.profile, &self.profile, &self.file_cfg.profile),
             device_id: self.device_id.clone(),
-            presence_url: self.presence_url.clone(),
-            presence_token: self.presence_token.clone(),
+            presence_url: keep(
+                self.env.presence_url,
+                &self.presence_url,
+                &self.file_cfg.presence_url,
+            ),
+            presence_token: keep(
+                self.env.presence_token,
+                &self.presence_token,
+                &self.file_cfg.presence_token,
+            ),
         }
     }
 
@@ -950,6 +1041,9 @@ impl App {
             g.stream_kind = kind.to_string();
             g.stream_id = self.playing_id.clone();
             g.stream_name = self.now_playing.clone();
+            // Re-read the panel's counters now: the last reading predates this
+            // stream, so it would still say nobody is watching.
+            g.force_account = true;
         }
     }
 
@@ -1011,7 +1105,7 @@ impl App {
         let me = self.profile_id();
         let (color, text) = pill_state(&roster, &me);
         let others: Vec<presence::Watcher> = roster.others(&me).into_iter().cloned().collect();
-        let mine = roster.my_devices(&me);
+        let mine = roster.mine(&me);
         let maxc = roster.max_connections;
         let _ = (mine, maxc, others);
 
@@ -1106,8 +1200,8 @@ impl App {
 
     /// Pre-play guard: warn before taking a line somebody else is on.
     fn guard_dialog(&mut self, ctx: &egui::Context) {
-        let (conflict, name) = match self.pending_play.as_ref() {
-            Some(p) => (p.conflict.clone(), p.name.clone()),
+        let conflict = match self.pending_play.as_ref() {
+            Some(p) => p.conflict.clone(),
             None => return,
         };
         let mut take_it = false;
@@ -1155,11 +1249,9 @@ impl App {
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "This line allows {} connection{}. Starting {} will kick {} off.",
+                        "This line allows {} connection{}. Starting will kick them off.",
                         slots,
-                        if slots == 1 { "" } else { "s" },
-                        clip(&name, 28),
-                        if conflict.is_unknown() { "them" } else { "them" }
+                        if slots == 1 { "" } else { "s" }
                     ))
                     .size(11.5)
                     .color(T_DANGER),
@@ -1185,7 +1277,6 @@ impl App {
         } else if take_it {
             if let Some(p) = self.pending_play.take() {
                 self.status = format!("Taking the line from {}", describe_conflict(&p.conflict));
-                let _ = p.kind;
                 self.start_stream(p.url);
             }
         }
@@ -2100,16 +2191,16 @@ fn presence_cli(action: Option<&str>) -> Result<(), String> {
                 return Ok(());
             };
             match decide_guard(active, maxc, roster.as_ref(), &pid) {
-                None => println!("guard   no warning - the stream would just start"),
-                Some(c) => {
+                GuardOutcome::Free => println!("guard   no warning - the stream would just start"),
+                GuardOutcome::Proceed { note } => {
+                    println!("guard   starts immediately, with a status note");
+                    println!("        \"{}\"", note);
+                }
+                GuardOutcome::Warn(c) => {
                     println!("guard   WARN before play");
-                    if c.is_unknown() {
-                        println!("        \"Someone is watching that we can't identify\"");
-                    } else {
-                        println!("        \"{} is watching\"", c.who);
-                        if !c.stream.is_empty() {
-                            println!("        \"{} · {}m in\"", c.stream, c.minutes);
-                        }
+                    println!("        \"{} is watching\"", c.who);
+                    if !c.stream.is_empty() {
+                        println!("        \"{} · {}m in\"", c.stream, c.minutes);
                     }
                     println!(
                         "        \"This line allows {} {}. Starting will kick them off.\"",
@@ -2185,7 +2276,7 @@ fn pill_state(roster: &Roster, me: &str) -> (egui::Color32, String) {
         .collect();
     names.sort();
     names.dedup();
-    let mine = roster.my_devices(me) > 0;
+    let mine = roster.mine(me);
     let maxc = roster.max_connections;
     let one_slot = maxc == 1;
 
@@ -2354,24 +2445,23 @@ mod tests {
         assert_eq!(color, T_SUCCESS);
     }
 
-    // The same bug class as the one-connection case: a *full* line is not an
-    // alarm when every connection on it is ours.
+    // A *full* line is not an alarm when every connection on it is one of us.
     #[test]
-    fn multi_connection_full_of_ourselves_is_fine() {
+    fn multi_connection_full_is_not_an_alarm() {
         let r = roster(
             4,
             4,
             vec![
                 watcher("peter", "Peter", F1, 60),
-                watcher("peter", "Peter", F1, 55),
-                watcher("peter", "Peter", F1, 50),
-                watcher("peter", "Peter", F1, 45),
+                watcher("blain", "Blain", F1, 55),
+                watcher("johnny", "Johnny", F1, 50),
+                watcher("panda", "Panda", F1, 45),
             ],
         );
-        assert_eq!(r.unaccounted, 0, "four devices, four connections: all accounted for");
+        assert_eq!(r.unaccounted, 0, "four people, four connections: all accounted for");
         let (color, text) = pill_state(&r, "peter");
-        assert_eq!(text, "Line is yours · 4/4");
-        assert_eq!(color, T_SUCCESS, "a full line with only us on it is not a conflict");
+        assert_eq!(text, "3 watching · Blain, Johnny +1");
+        assert_ne!(color, T_DANGER, "a full line with only friends on it is not a conflict");
     }
 
     #[test]
@@ -2387,36 +2477,42 @@ mod tests {
     }
 
     #[test]
-    fn multi_connection_ignores_my_own_second_device() {
-        let r = roster(
-            2,
-            4,
-            vec![
-                watcher("peter", "Peter", F1, 60),
-                watcher("peter", "Peter", "Sky Sports Main Event", 10),
-            ],
-        );
+    fn multi_connection_ignores_my_own_entry() {
+        let r = roster(1, 4, vec![watcher("peter", "Peter", F1, 60)]);
         let (_, text) = pill_state(&r, "peter");
-        assert_eq!(text, "Line is yours · 2/4", "our own devices are not 'others'");
+        assert_eq!(text, "Line is yours · 1/4", "our own entry is not an 'other'");
     }
 
     /* -------------------------------------------------------------- guard */
 
+    fn warned(o: &GuardOutcome) -> Option<Conflict> {
+        match o {
+            GuardOutcome::Warn(c) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
+    fn note(o: &GuardOutcome) -> Option<String> {
+        match o {
+            GuardOutcome::Proceed { note } => Some(note.clone()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn guard_is_silent_on_a_free_line() {
         let r = roster(0, 1, vec![]);
-        assert!(decide_guard(0, 1, Some(&r), "peter").is_none());
+        assert!(matches!(decide_guard(0, 1, Some(&r), "peter"), GuardOutcome::Free));
     }
 
     #[test]
     fn guard_names_the_other_watcher() {
         let r = roster(1, 1, vec![watcher("blain", "Blain", F1, 38 * 60)]);
-        let c = decide_guard(1, 1, Some(&r), "peter").expect("should warn");
+        let c = warned(&decide_guard(1, 1, Some(&r), "peter")).expect("should warn");
         assert_eq!(c.who, "Blain");
         assert_eq!(c.stream, F1);
         assert_eq!(c.minutes, 38);
         assert_eq!(c.max_connections, 1);
-        assert!(!c.is_unknown());
     }
 
     #[test]
@@ -2426,31 +2522,53 @@ mod tests {
             4,
             vec![watcher("johnny", "Johnny", F1, 60), watcher("blain", "Blain", F1, 30)],
         );
-        let c = decide_guard(2, 4, Some(&r), "peter").expect("should warn");
+        let c = warned(&decide_guard(2, 4, Some(&r), "peter")).expect("should warn");
         assert_eq!(c.who, "Johnny", "roster is freshest-first");
     }
 
     #[test]
     fn guard_blames_our_other_device_rather_than_a_stranger() {
         let r = roster(1, 1, vec![watcher("peter", "Peter", F1, 60)]);
-        let c = decide_guard(1, 1, Some(&r), "peter").expect("should warn");
+        let c = warned(&decide_guard(1, 1, Some(&r), "peter")).expect("should warn");
         assert_eq!(c.who, "You (another device)");
-    }
-
-    // The worker may be unreachable - the panel still knows the line is busy,
-    // so we warn without attribution rather than letting it pass silently.
-    #[test]
-    fn guard_still_warns_when_the_worker_is_unreachable() {
-        let c = decide_guard(1, 1, None, "peter").expect("should warn");
-        assert!(c.is_unknown());
-        assert_eq!(c.who, "");
     }
 
     #[test]
     fn guard_warns_even_when_the_limit_is_unknown() {
         let r = roster(3, 0, vec![watcher("blain", "Blain", F1, 60)]);
-        let c = decide_guard(3, 0, Some(&r), "peter").expect("busy is busy");
+        let c = warned(&decide_guard(3, 0, Some(&r), "peter")).expect("busy is busy");
         assert_eq!(c.who, "Blain");
+    }
+
+    /// The policy that came out of measuring a real panel: a nonzero
+    /// active_cons with nobody checked in must NOT stop the user.
+    ///
+    /// It can mean a watcher we cannot see, or it can mean the panel's counter
+    /// lagging behind a stream that already ended - observed holding at 1 for
+    /// over four minutes with nothing of ours running. A modal on that reading
+    /// would fire on every single play attempt, so it proceeds with a note.
+    #[test]
+    fn guard_does_not_block_on_an_unclaimed_connection() {
+        let free_roster = roster(1, 1, vec![]);
+        let o = decide_guard(1, 1, Some(&free_roster), "peter");
+        assert!(warned(&o).is_none(), "an unclaimed connection must not block");
+        let n = note(&o).expect("should still say something");
+        assert!(n.contains("1/1"), "note should carry the counts: {}", n);
+    }
+
+    // Same ambiguity when the worker cannot be reached at all.
+    #[test]
+    fn guard_still_proceeds_when_the_worker_is_unreachable() {
+        let o = decide_guard(1, 1, None, "peter");
+        assert!(warned(&o).is_none());
+        assert!(note(&o).is_some());
+    }
+
+    /// ...but a friend we *can* name still stops it, worker reachable or not.
+    #[test]
+    fn guard_still_warns_when_it_can_name_someone() {
+        let r = roster(1, 1, vec![watcher("blain", "Blain", F1, 60)]);
+        assert!(warned(&decide_guard(1, 1, Some(&r), "peter")).is_some());
     }
 }
 
