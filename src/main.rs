@@ -599,8 +599,6 @@ struct App {
     /// Item id of the current stream, so presence can report *what* is on.
     playing_id: String,
     show_settings: bool,
-    /// Reveal the credential fields even though the panel already accepted them.
-    show_credentials: bool,
     /// Two-step guard in front of the destructive reset.
     confirm_reset: bool,
     wizard: bool,
@@ -780,7 +778,6 @@ impl Default for App {
             now_playing: String::new(),
             playing_id: String::new(),
             show_settings: std::env::var("EG_SETTINGS").is_ok(),
-            show_credentials: false,
             confirm_reset: false,
             wizard: !autostart,
             vol_reapply: 0,
@@ -1580,7 +1577,6 @@ impl App {
 
         self.wizard = true;
         self.show_settings = false;
-        self.show_credentials = false;
         self.confirm_reset = false;
         // Volume survives a reset on purpose: wiping credentials should not make
         // the next stream deafening.
@@ -1628,46 +1624,33 @@ impl App {
         let m = egui::Margin::symmetric(6.0, 5.0);
         ui.set_width(320.0);
         ui.add_space(2.0);
-        // Credentials are set once. Once the panel has
-        // accepted them there is nothing here to look at, so
-        // they collapse to a summary - with a way back in,
-        // because a changed password still has to be fixable.
-        let connected = self.client.is_some();
-        if connected && !self.show_credentials {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Set up for {}", self.user))
-                        .size(11.0)
-                        .color(T_MUTED),
-                );
-                if ui.small_button("Change").clicked() {
-                    self.show_credentials = true;
-                }
-            });
+        // Always expanded. Collapsing these behind a "Change" button read as a
+        // dead end rather than a tidy summary.
+        ui.label(egui::RichText::new("Server").size(11.0).color(T_MUTED));
+        ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(320.0).margin(m));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Username").size(11.0).color(T_MUTED));
+        ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(320.0).margin(m));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Password").size(11.0).color(T_MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.pass)
+                .desired_width(320.0)
+                .password(true)
+                .margin(m),
+        );
+        ui.add_space(10.0);
+        let connecting = self.rx.is_some();
+        let label = if connecting {
+            "Connecting..."
+        } else if self.client.is_some() {
+            "Reconnect"
         } else {
-            ui.label(egui::RichText::new("Server").size(11.0).color(T_MUTED));
-            ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(320.0).margin(m));
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Username").size(11.0).color(T_MUTED));
-            ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(320.0).margin(m));
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Password").size(11.0).color(T_MUTED));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.pass)
-                    .desired_width(320.0)
-                    .password(true)
-                    .margin(m),
-            );
-            ui.add_space(10.0);
-            let connecting = self.rx.is_some();
-            let label = if connecting { "Connecting..." } else { "Connect" };
-            if ui.add_sized([320.0, 30.0], egui::Button::new(label)).clicked()
-                && !connecting
-            {
-                save_config(&self.config_snapshot());
-                self.spawn_login();
-                self.show_credentials = false;
-            }
+            "Connect"
+        };
+        if ui.add_sized([320.0, 30.0], egui::Button::new(label)).clicked() && !connecting {
+            save_config(&self.config_snapshot());
+            self.spawn_login();
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
