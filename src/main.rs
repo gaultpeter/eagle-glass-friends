@@ -1008,7 +1008,11 @@ impl App {
     /// Push identity and playback state down to the presence thread. Cheap
     /// enough to run every frame; it is one mutex lock and a few clones.
     fn presence_sync(&mut self) {
-        let state = if self.player.is_playing() { "playing" } else { "paused" };
+        // State comes from what the user asked for, not from polling libVLC:
+        // is_playing() reports not-playing while rebuffering, so a single flaky
+        // reading used to show "paused" on the dashboard for up to 90 seconds
+        // while the picture was fine.
+        let state = if self.paused_by_user { "paused" } else { "playing" };
         let id = self.profile_id();
 
         // Picking a name is a choice worth keeping. Without this, choosing it

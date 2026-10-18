@@ -110,15 +110,16 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// What counts as "a different thing to report". Deliberately excludes
-    /// `state`: libVLC reports not-playing while it buffers, so including it made
-    /// the signature flap and roughly doubled the heartbeat rate (and therefore
-    /// the KV write cost). Pausing is cosmetic - the connection is held either
-    /// way - so it can wait for the next timed beat.
+    /// What counts as "a different thing to report".
+    ///
+    /// `state` is included, but it now comes from the user's intent rather than
+    /// from polling libVLC, so it only changes when somebody presses pause. An
+    /// earlier version derived it from `is_playing()`, which reports not-playing
+    /// while buffering - that flapped and doubled the heartbeat rate.
     pub fn signature(&self) -> String {
         format!(
-            "{}|{}|{}|{}",
-            self.profile, self.stream_kind, self.stream_id, self.stream_name
+            "{}|{}|{}|{}|{}",
+            self.profile, self.state, self.stream_kind, self.stream_id, self.stream_name
         )
     }
 }
@@ -300,12 +301,17 @@ fn str_at(v: &Value, key: &str) -> String {
 }
 
 fn int_at(v: &Value, key: &str) -> i64 {
+    opt_int(v, key).unwrap_or(0)
+}
+
+/// `None` when the field is absent, so a genuine 0 can be told apart from a
+/// panel that did not answer.
+fn opt_int(v: &Value, key: &str) -> Option<i64> {
     match v.get(key) {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-        // The panel (and therefore the worker, for the account block) may hand
-        // numbers back as strings.
-        Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
-        _ => 0,
+        Some(Value::Number(n)) => n.as_i64(),
+        // The panel hands these back as strings on most builds.
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 
@@ -407,14 +413,18 @@ fn run(shared: Arc<Mutex<Shared>>, roster: Arc<Mutex<Roster>>) {
             last_account = now;
             if let Ok(panel) = crate::Xtream::new(&snap.server, &snap.user, &snap.pass) {
                 if let Ok(info) = panel.authenticate() {
-                    let ac = int_at(&info, "active_cons");
-                    let mc = int_at(&info, "max_connections");
+                    // Update on any *reported* value, including a genuine zero.
+                    // The old `if ac > 0` guard meant a real 0 could never
+                    // correct a stale nonzero, and the panel's counter is slow
+                    // to move in both directions.
+                    let ac = opt_int(&info, "active_cons");
+                    let mc = opt_int(&info, "max_connections");
                     if let Ok(mut g) = shared.lock() {
-                        if ac > 0 {
-                            g.active_cons = ac;
+                        if let Some(v) = ac {
+                            g.active_cons = v;
                         }
-                        if mc > 0 {
-                            g.max_connections = mc;
+                        if let Some(v) = mc {
+                            g.max_connections = v;
                         }
                     }
                 }
