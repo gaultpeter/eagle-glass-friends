@@ -68,6 +68,72 @@ struct Config {
     /// Last volume the user settled on, 0-100. 100 is the default only for a
     /// config that predates this field.
     volume: i32,
+    /// Picture settings remembered per stream, so a channel you tuned comes back
+    /// the way you left it.
+    pictures: Vec<Picture>,
+}
+
+/// Brightness/contrast/gamma for one stream.
+#[derive(Clone)]
+struct Picture {
+    /// Stream id, which is what the panel uses and what a client asks for.
+    id: String,
+    /// Kept only so the config file is readable when you open it.
+    name: String,
+    bright: f32,
+    contrast: f32,
+    gamma: f32,
+}
+
+/// Slider ranges, shared by the UI and the config loader so a hand-edited file
+/// cannot put a slider out of range.
+const PIC_BRIGHT: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+const PIC_GAMMA: std::ops::RangeInclusive<f32> = 0.5..=3.0;
+/// Enough for any realistic amount of tuning; the oldest entries drop first.
+const PIC_LIMIT: usize = 200;
+
+fn clamp_picture(bright: f32, contrast: f32, gamma: f32) -> (f32, f32, f32) {
+    (
+        bright.clamp(*PIC_BRIGHT.start(), *PIC_BRIGHT.end()),
+        contrast.clamp(*PIC_BRIGHT.start(), *PIC_BRIGHT.end()),
+        gamma.clamp(*PIC_GAMMA.start(), *PIC_GAMMA.end()),
+    )
+}
+
+/// What a stream should look like: its saved settings, or untouched defaults.
+fn picture_for(pictures: &[Picture], id: &str) -> (f32, f32, f32) {
+    match pictures.iter().find(|p| p.id == id) {
+        Some(p) => (p.bright, p.contrast, p.gamma),
+        None => (1.0, 1.0, 1.0),
+    }
+}
+
+/// Insert or replace the entry for a stream, newest last so that a full list
+/// drops the least recently tuned rather than the oldest stream id.
+fn upsert_picture(
+    pictures: &mut Vec<Picture>,
+    id: &str,
+    name: &str,
+    bright: f32,
+    contrast: f32,
+    gamma: f32,
+) {
+    // Three decimals: enough to be exact on screen, short enough that the config
+    // file stays readable when someone opens it.
+    let round = |v: f32| (v * 1000.0).round() / 1000.0;
+    let (bright, contrast, gamma) = clamp_picture(round(bright), round(contrast), round(gamma));
+    pictures.retain(|p| p.id != id);
+    pictures.push(Picture {
+        id: id.to_string(),
+        name: name.to_string(),
+        bright,
+        contrast,
+        gamma,
+    });
+    if pictures.len() > PIC_LIMIT {
+        let excess = pictures.len() - PIC_LIMIT;
+        pictures.drain(0..excess);
+    }
 }
 
 fn load_config() -> Config {
@@ -108,6 +174,26 @@ fn load_config() -> Config {
                     cfg.volume = v.clamp(0, 100);
                 }
             }
+            "pic" => {
+                // pic=<stream id>|<brightness>|<contrast>|<gamma>|<name>
+                let parts: Vec<&str> = value.splitn(5, '|').collect();
+                if parts.len() >= 4 {
+                    if let (Ok(b), Ok(c), Ok(g)) = (
+                        parts[1].trim().parse::<f32>(),
+                        parts[2].trim().parse::<f32>(),
+                        parts[3].trim().parse::<f32>(),
+                    ) {
+                        let (bright, contrast, gamma) = clamp_picture(b, c, g);
+                        cfg.pictures.push(Picture {
+                            id: parts[0].trim().to_string(),
+                            name: parts.get(4).map(|s| s.trim().to_string()).unwrap_or_default(),
+                            bright,
+                            contrast,
+                            gamma,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -119,7 +205,7 @@ fn save_config(cfg: &Config) {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let data = format!(
+        let mut data = format!(
             "server={}\nuser={}\npass={}\nformat={}\nprofile={}\ndevice_id={}\npresence_url={}\npresence_token={}\nvolume={}\n",
             cfg.server,
             cfg.user,
@@ -131,6 +217,14 @@ fn save_config(cfg: &Config) {
             cfg.presence_token,
             cfg.volume
         );
+        // One line per tuned stream. Kept last so the familiar settings stay at
+        // the top of the file.
+        for p in &cfg.pictures {
+            data.push_str(&format!(
+                "pic={}|{:.3}|{:.3}|{:.3}|{}\n",
+                p.id, p.bright, p.contrast, p.gamma, p.name
+            ));
+        }
         let _ = std::fs::write(&p, data);
     }
 }
@@ -641,6 +735,10 @@ struct App {
     /// Volume as last written to disk, plus when to write a pending change.
     persisted_volume: i32,
     volume_save_at: i64,
+    /// Picture settings remembered per stream.
+    pictures: Vec<Picture>,
+    picture_dirty: bool,
+    picture_save_at: i64,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -728,6 +826,7 @@ impl Default for App {
         };
         let persisted_profile = cfg.profile.clone();
         let file_cfg = cfg;
+        let start_pictures = file_cfg.pictures.clone();
 
         // The player starts at a hardcoded 100, so apply the remembered level
         // before anything can play. Without this, every fresh instance is at
@@ -807,6 +906,9 @@ impl Default for App {
             persisted_profile,
             persisted_volume: start_volume,
             volume_save_at: 0,
+            pictures: start_pictures,
+            picture_dirty: false,
+            picture_save_at: 0,
         }
     }
 }
@@ -880,6 +982,7 @@ impl App {
         let fmt = self.live_format.clone();
         self.now_playing = item.name.clone();
         self.playing_id = item.id.clone();
+        self.apply_saved_picture(&item.id);
 
         // Only guard when we are not already holding the connection: once a
         // stream is up, zapping channels cannot displace anybody.
@@ -996,6 +1099,7 @@ impl App {
             // The audible level, not 0: if you mute and then quit, the next
             // launch should not start silent with no obvious explanation.
             volume: self.live_volume(),
+            pictures: self.pictures.clone(),
             presence_url: keep(
                 self.env.presence_url,
                 &self.presence_url,
@@ -1619,6 +1723,57 @@ impl App {
         }
     }
 
+    /// Apply whatever was remembered for a stream, or the untouched defaults if
+    /// it has never been tuned. Called when a channel is picked, so the sliders
+    /// are already showing that channel's settings before the picture appears.
+    fn apply_saved_picture(&mut self, id: &str) {
+        let (b, c, g) = picture_for(&self.pictures, id);
+        if (self.bright, self.contrast, self.gamma) != (b, c, g) {
+            self.bright = b;
+            self.contrast = c;
+            self.gamma = g;
+            self.player.set_picture(b, c, g);
+        }
+    }
+
+    /// Remember the picture for the stream that is on.
+    fn record_picture(&mut self) {
+        if self.playing_id.is_empty() {
+            return;
+        }
+        upsert_picture(
+            &mut self.pictures,
+            &self.playing_id,
+            &self.now_playing,
+            self.bright,
+            self.contrast,
+            self.gamma,
+        );
+        save_config(&self.config_snapshot());
+        if !self.now_playing.is_empty() {
+            self.status = format!("Picture saved for {}", self.now_playing);
+        }
+    }
+
+    /// Write picture tweaks once they settle. A slider reports a change on every
+    /// pixel of a drag, and this must not be one file write per pixel.
+    fn persist_picture(&mut self, ctx: &egui::Context) {
+        if !self.picture_dirty {
+            return;
+        }
+        let now = presence::now_ms();
+        if self.picture_save_at == 0 {
+            self.picture_save_at = now + 700;
+        }
+        if now >= self.picture_save_at {
+            self.picture_save_at = 0;
+            self.picture_dirty = false;
+            self.record_picture();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
     /// The settings form itself, laid out in the docked panel.
     fn settings_body(&mut self, ui: &mut egui::Ui) {
         let m = egui::Margin::symmetric(6.0, 5.0);
@@ -1667,7 +1822,7 @@ impl App {
         ui.separator();
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("Picture (fix washed-out UHD / HDR)")
+            egui::RichText::new("Picture")
                 .size(10.5)
                 .color(T_MUTED),
         );
@@ -1703,6 +1858,26 @@ impl App {
         }
         if changed {
             self.player.set_picture(self.bright, self.contrast, self.gamma);
+            // Remember it against the stream that is on, so coming back to this
+            // channel re-applies it. The write itself is debounced in
+            // persist_picture, and the status line is set there so it reports a
+            // save that has actually happened.
+            if self.playing_id.is_empty() {
+                self.status = "Picture changes are only kept for a stream that is playing".into();
+            } else {
+                self.picture_dirty = true;
+            }
+        }
+        if !self.playing_id.is_empty() {
+            let stored = self.pictures.iter().find(|p| p.id == self.playing_id);
+            let hint = match stored {
+                Some(_) => "Saved for this channel; it comes back next time you open it.",
+                None => "Adjusting here remembers the setting for this channel.",
+            };
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(hint).size(10.5).color(T_MUTED)).wrap(),
+            );
         }
         ui.add_space(12.0);
         ui.separator();
@@ -1836,6 +2011,7 @@ impl eframe::App for App {
         self.ensure_presence_thread();
         self.presence_sync();
         self.persist_volume(ctx);
+        self.persist_picture(ctx);
         self.detect_drop();
         self.check_stream_drop();
 
@@ -2772,6 +2948,81 @@ mod tests {
         let r = roster(1, 4, vec![watcher("peter", "Peter", F1, 60)]);
         let (_, text) = pill_state(&r, "peter");
         assert_eq!(text, "Line is yours · 1/4", "our own entry is not an 'other'");
+    }
+
+    /* ---------------------------------------------------- per-channel picture */
+
+    fn pic(id: &str, b: f32, c: f32, g: f32) -> Picture {
+        Picture {
+            id: id.to_string(),
+            name: format!("channel {}", id),
+            bright: b,
+            contrast: c,
+            gamma: g,
+        }
+    }
+
+    #[test]
+    fn an_untuned_channel_gets_untouched_defaults() {
+        let pics = vec![pic("228637", 1.5, 1.2, 0.9)];
+        assert_eq!(picture_for(&pics, "228637"), (1.5, 1.2, 0.9));
+        assert_eq!(picture_for(&pics, "91203"), (1.0, 1.0, 1.0));
+        assert_eq!(picture_for(&[], "anything"), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn tuning_a_channel_records_it() {
+        let mut pics = Vec::new();
+        upsert_picture(&mut pics, "228637", "Sky Sports Main Event", 1.4, 1.1, 0.8);
+        assert_eq!(picture_for(&pics, "228637"), (1.4, 1.1, 0.8));
+        assert_eq!(pics.len(), 1);
+    }
+
+    #[test]
+    fn retuning_replaces_rather_than_appends() {
+        let mut pics = Vec::new();
+        upsert_picture(&mut pics, "228637", "one", 1.4, 1.0, 1.0);
+        upsert_picture(&mut pics, "228637", "one", 1.9, 1.0, 1.0);
+        assert_eq!(pics.len(), 1, "same channel must not accumulate entries");
+        assert_eq!(picture_for(&pics, "228637"), (1.9, 1.0, 1.0));
+    }
+
+    #[test]
+    fn retuning_moves_the_entry_to_the_end() {
+        let mut pics = Vec::new();
+        upsert_picture(&mut pics, "a", "a", 1.1, 1.0, 1.0);
+        upsert_picture(&mut pics, "b", "b", 1.2, 1.0, 1.0);
+        upsert_picture(&mut pics, "a", "a", 1.3, 1.0, 1.0);
+        assert_eq!(pics.last().unwrap().id, "a", "most recent tuning goes last");
+    }
+
+    #[test]
+    fn a_full_list_drops_the_least_recently_tuned() {
+        let mut pics = Vec::new();
+        for i in 0..(PIC_LIMIT + 5) {
+            upsert_picture(&mut pics, &format!("id{}", i), "n", 1.0, 1.0, 1.0);
+        }
+        assert_eq!(pics.len(), PIC_LIMIT);
+        assert!(picture_for(&pics, "id0") == (1.0, 1.0, 1.0), "oldest dropped");
+        assert!(pics.iter().any(|p| p.id == format!("id{}", PIC_LIMIT + 4)), "newest kept");
+    }
+
+    #[test]
+    fn values_are_rounded_for_a_readable_config() {
+        let mut pics = Vec::new();
+        upsert_picture(&mut pics, "x", "x", 1.234567, 0.987654, 1.000001);
+        let p = &pics[0];
+        assert_eq!((p.bright, p.contrast, p.gamma), (1.235, 0.988, 1.0));
+    }
+
+    #[test]
+    fn a_hand_edited_value_outside_the_slider_range_is_clamped() {
+        let mut pics = Vec::new();
+        upsert_picture(&mut pics, "x", "x", 99.0, -5.0, 42.0);
+        let p = &pics[0];
+        assert_eq!(p.bright, 2.0);
+        assert_eq!(p.contrast, 0.5);
+        assert_eq!(p.gamma, 3.0);
     }
 
     /* -------------------------------------------------------------- guard */
