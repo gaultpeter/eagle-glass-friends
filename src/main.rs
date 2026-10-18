@@ -65,10 +65,18 @@ struct Config {
     device_id: String,
     presence_url: String,
     presence_token: String,
+    /// Last volume the user settled on, 0-100. 100 is the default only for a
+    /// config that predates this field.
+    volume: i32,
 }
 
 fn load_config() -> Config {
-    let mut cfg = Config::default();
+    // Note the explicit volume default: a plain derive would make it 0 and a
+    // fresh instance would start silent, which is its own kind of surprise.
+    let mut cfg = Config {
+        volume: 100,
+        ..Default::default()
+    };
     let p = match config_path() {
         Some(p) => p,
         None => return cfg,
@@ -95,6 +103,11 @@ fn load_config() -> Config {
             "device_id" => cfg.device_id = value,
             "presence_url" => cfg.presence_url = value,
             "presence_token" => cfg.presence_token = value,
+            "volume" => {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    cfg.volume = v.clamp(0, 100);
+                }
+            }
             _ => {}
         }
     }
@@ -107,7 +120,7 @@ fn save_config(cfg: &Config) {
             let _ = std::fs::create_dir_all(dir);
         }
         let data = format!(
-            "server={}\nuser={}\npass={}\nformat={}\nprofile={}\ndevice_id={}\npresence_url={}\npresence_token={}\n",
+            "server={}\nuser={}\npass={}\nformat={}\nprofile={}\ndevice_id={}\npresence_url={}\npresence_token={}\nvolume={}\n",
             cfg.server,
             cfg.user,
             cfg.pass,
@@ -115,7 +128,8 @@ fn save_config(cfg: &Config) {
             cfg.profile,
             cfg.device_id,
             cfg.presence_url,
-            cfg.presence_token
+            cfg.presence_token,
+            cfg.volume
         );
         let _ = std::fs::write(&p, data);
     }
@@ -626,6 +640,9 @@ struct App {
     env: EnvOverrides,
     /// The profile as last written to disk, so a change is saved once.
     persisted_profile: String,
+    /// Volume as last written to disk, plus when to write a pending change.
+    persisted_volume: i32,
+    volume_save_at: i64,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -714,6 +731,13 @@ impl Default for App {
         let persisted_profile = cfg.profile.clone();
         let file_cfg = cfg;
 
+        // The player starts at a hardcoded 100, so apply the remembered level
+        // before anything can play. Without this, every fresh instance is at
+        // full volume until you touch the slider.
+        let mut player = video::Player::new();
+        let start_volume = file_cfg.volume.max(1);
+        player.set_volume(start_volume);
+
         let autostart = !user.is_empty() && !pass.is_empty();
 
         let shared = Arc::new(Mutex::new(Shared {
@@ -743,12 +767,12 @@ impl Default for App {
             client: None,
             side_width: None,
             width_applied: false,
-            player: video::Player::new(),
+            player,
             autostart,
             autoplay: std::env::var("EG_AUTOPLAY").ok().filter(|s| !s.is_empty()),
             fullscreen: false,
             muted: false,
-            pre_mute_vol: 100,
+            pre_mute_vol: start_volume,
             open_live: true,
             open_vod: false,
             open_series: false,
@@ -784,6 +808,8 @@ impl Default for App {
             file_cfg,
             env: overrides,
             persisted_profile,
+            persisted_volume: start_volume,
+            volume_save_at: 0,
         }
     }
 }
@@ -970,6 +996,9 @@ impl App {
             format: keep(self.env.format, &self.live_format, &self.file_cfg.format),
             profile: keep(self.env.profile, &self.profile, &self.file_cfg.profile),
             device_id: self.device_id.clone(),
+            // The audible level, not 0: if you mute and then quit, the next
+            // launch should not start silent with no obvious explanation.
+            volume: self.live_volume(),
             presence_url: keep(
                 self.env.presence_url,
                 &self.presence_url,
@@ -1553,6 +1582,45 @@ impl App {
         self.show_settings = false;
         self.show_credentials = false;
         self.confirm_reset = false;
+        // Volume survives a reset on purpose: wiping credentials should not make
+        // the next stream deafening.
+        self.persisted_volume = self.live_volume();
+        self.volume_save_at = 0;
+    }
+
+    /// The volume that should be remembered: the audible one, so muting and
+    /// quitting does not persist a silent start.
+    fn live_volume(&self) -> i32 {
+        if self.muted {
+            self.pre_mute_vol.max(1)
+        } else {
+            self.player.volume().max(1)
+        }
+    }
+
+    /// Remember the volume, so a fresh instance does not blast the speakers.
+    ///
+    /// Debounced: the slider reports a change on every pixel of a drag, and this
+    /// should write the file once the value settles rather than forty times.
+    fn persist_volume(&mut self, ctx: &egui::Context) {
+        let live = self.live_volume();
+        if live == self.persisted_volume {
+            self.volume_save_at = 0;
+            return;
+        }
+        let now = presence::now_ms();
+        if self.volume_save_at == 0 {
+            self.volume_save_at = now + 700;
+        }
+        if now >= self.volume_save_at {
+            self.persisted_volume = live;
+            self.volume_save_at = 0;
+            save_config(&self.config_snapshot());
+        } else {
+            // Nothing else may repaint while the app sits idle, so make sure we
+            // come back to actually perform the write.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// The settings form itself, laid out in the docked panel.
@@ -1784,6 +1852,7 @@ impl eframe::App for App {
 
         self.ensure_presence_thread();
         self.presence_sync();
+        self.persist_volume(ctx);
         self.detect_drop();
         self.check_stream_drop();
 
