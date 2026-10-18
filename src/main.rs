@@ -1,0 +1,1886 @@
+mod presence;
+mod video;
+mod xtream;
+
+use eframe::egui;
+use raw_window_handle::HasWindowHandle;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use presence::{Roster, Shared};
+use xtream::{Item, Kind, Xtream, DEFAULT_SERVER};
+
+const T_BG: egui::Color32 = egui::Color32::from_rgb(0x10, 0x12, 0x17);
+const T_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x20);
+const T_TOP: egui::Color32 = egui::Color32::from_rgb(0x19, 0x1c, 0x23);
+const T_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x20, 0x24, 0x2d);
+const T_SURFACE2: egui::Color32 = egui::Color32::from_rgb(0x29, 0x2e, 0x38);
+const T_BORDER: egui::Color32 = egui::Color32::from_rgb(0x30, 0x35, 0x41);
+const T_TEXT: egui::Color32 = egui::Color32::from_rgb(0xf1, 0xf3, 0xf8);
+const T_MUTED: egui::Color32 = egui::Color32::from_rgb(0x9a, 0xa4, 0xb5);
+const T_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x89, 0x98, 0xff);
+const T_ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0x30, 0x37, 0x50);
+const T_DANGER: egui::Color32 = egui::Color32::from_rgb(0xff, 0x73, 0x7a);
+const T_SUCCESS: egui::Color32 = egui::Color32::from_rgb(0x56, 0xd6, 0x9a);
+
+fn pill(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
+    let _ = pill_resp(ui, color, text);
+}
+
+/// Same pill, but hands back the response so callers can attach hover text.
+fn pill_resp(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
+    egui::Frame::none()
+        .fill(T_SURFACE)
+        .rounding(egui::Rounding::same(999.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 4.5, color);
+                ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(T_TEXT)));
+            });
+        })
+        .response
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("APPDATA")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))?;
+    Some(std::path::Path::new(&base).join("EagleGlass").join("config.txt"))
+}
+
+/// Everything kept on disk. This used to be a 4-tuple written by a function
+/// that emitted exactly four lines, which would silently erase any extra
+/// setting the moment the settings dialog was used - so presence config has to
+/// live in the same struct that gets written back.
+#[derive(Clone, Default)]
+struct Config {
+    server: String,
+    user: String,
+    pass: String,
+    format: String,
+    profile: String,
+    device_id: String,
+    presence_url: String,
+    presence_token: String,
+}
+
+fn load_config() -> Config {
+    let mut cfg = Config::default();
+    let p = match config_path() {
+        Some(p) => p,
+        None => return cfg,
+    };
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return cfg,
+    };
+    for line in text.lines() {
+        let mut it = line.splitn(2, '=');
+        let (key, value) = match (it.next(), it.next()) {
+            (Some(k), Some(v)) => (k.trim(), v.to_string()),
+            _ => continue,
+        };
+        match key {
+            "server" => cfg.server = value,
+            "user" => cfg.user = value,
+            "pass" => cfg.pass = value,
+            "format" => cfg.format = value,
+            "profile" => cfg.profile = value,
+            "device_id" => cfg.device_id = value,
+            "presence_url" => cfg.presence_url = value,
+            "presence_token" => cfg.presence_token = value,
+            _ => {}
+        }
+    }
+    cfg
+}
+
+fn save_config(cfg: &Config) {
+    if let Some(p) = config_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let data = format!(
+            "server={}\nuser={}\npass={}\nformat={}\nprofile={}\ndevice_id={}\npresence_url={}\npresence_token={}\n",
+            cfg.server,
+            cfg.user,
+            cfg.pass,
+            cfg.format,
+            cfg.profile,
+            cfg.device_id,
+            cfg.presence_url,
+            cfg.presence_token
+        );
+        let _ = std::fs::write(&p, data);
+    }
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = T_BG;
+    v.window_fill = T_SIDEBAR;
+    v.extreme_bg_color = T_SIDEBAR;
+    v.faint_bg_color = T_SURFACE;
+    v.override_text_color = Some(T_TEXT);
+    v.window_stroke = egui::Stroke::new(1.0_f32, T_BORDER);
+    v.hyperlink_color = T_ACCENT;
+    v.selection.bg_fill = T_ACCENT_SOFT;
+    v.selection.stroke = egui::Stroke::new(1.0_f32, T_ACCENT);
+
+    let r = egui::Rounding::same(6.0);
+    v.widgets.noninteractive.bg_fill = T_SIDEBAR;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, T_BORDER);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, T_MUTED);
+    v.widgets.noninteractive.rounding = r;
+    v.widgets.inactive.bg_fill = T_SURFACE2;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, T_BORDER);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, T_TEXT);
+    v.widgets.inactive.rounding = r;
+    v.widgets.hovered.bg_fill = T_SURFACE;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, T_ACCENT);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, T_TEXT);
+    v.widgets.hovered.rounding = r;
+    v.widgets.active.bg_fill = T_ACCENT_SOFT;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, T_ACCENT);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, T_TEXT);
+    v.widgets.active.rounding = r;
+    v.widgets.open.bg_fill = T_SURFACE;
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, T_BORDER);
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, T_TEXT);
+    v.widgets.open.rounding = r;
+    ctx.set_visuals(v);
+
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+    });
+}
+
+fn truncate_text(ui: &egui::Ui, s: &str, font: &egui::FontId, max: f32) -> String {
+    let w = ui.fonts(|f| f.layout_no_wrap(s.to_string(), font.clone(), T_TEXT)).size().x;
+    if w <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mut probe = out.clone();
+        probe.push(ch);
+        probe.push('…');
+        if ui.fonts(|f| f.layout_no_wrap(probe, font.clone(), T_TEXT)).size().x > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn side_header(ui: &mut egui::Ui, open: bool, label: &str, count: usize) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, T_SURFACE);
+    }
+    let chev = if open { "v" } else { ">" };
+    ui.painter().text(
+        egui::pos2(rect.min.x + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        chev,
+        egui::FontId::proportional(12.0),
+        T_MUTED,
+    );
+    let font = egui::FontId::proportional(11.5);
+    let text = truncate_text(ui, label, &font, rect.width() - 58.0);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 22.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        T_TEXT,
+    );
+    ui.painter().text(
+        egui::pos2(rect.max.x - 9.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(11.0),
+        T_MUTED,
+    );
+    resp.clicked()
+}
+
+fn side_row(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 5.0, T_ACCENT_SOFT);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(2.5, rect.height())),
+            1.0,
+            T_ACCENT,
+        );
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, T_SURFACE);
+    }
+    let color = if selected || resp.hovered() { T_TEXT } else { T_MUTED };
+    let font = egui::FontId::proportional(12.5);
+    let text = truncate_text(ui, label, &font, rect.width() - 28.0);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 18.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+    resp.clicked()
+}
+
+fn cat_node(ui: &mut egui::Ui, expanded: bool, selected: bool, label: &str, count: usize) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 5.0, T_ACCENT_SOFT);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, T_SURFACE);
+    }
+    let chev = if expanded { "v" } else { ">" };
+    ui.painter().text(
+        egui::pos2(rect.min.x + 16.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        chev,
+        egui::FontId::proportional(10.0),
+        T_MUTED,
+    );
+    let color = if selected || resp.hovered() { T_TEXT } else { T_MUTED };
+    let font = egui::FontId::proportional(12.0);
+    let text = truncate_text(ui, label, &font, rect.width() - 78.0);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 32.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+    if count > 0 {
+        ui.painter().text(
+            egui::pos2(rect.max.x - 9.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            count.to_string(),
+            egui::FontId::proportional(10.5),
+            T_MUTED,
+        );
+    }
+    resp.clicked()
+}
+
+fn side_chan(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 5.0, T_ACCENT_SOFT);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(2.5, rect.height())),
+            1.0,
+            T_ACCENT,
+        );
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, T_SURFACE);
+    }
+    let color = if selected || resp.hovered() { T_TEXT } else { T_MUTED };
+    let font = egui::FontId::proportional(12.0);
+    let text = truncate_text(ui, label, &font, rect.width() - 50.0);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 40.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+    resp.clicked()
+}
+
+fn live_badge(ui: &mut egui::Ui, a: f32) {
+    let font = egui::FontId::proportional(11.0);
+    let text_w = ui
+        .fonts(|f| f.layout_no_wrap("LIVE".to_string(), font.clone(), egui::Color32::WHITE))
+        .size()
+        .x;
+    let pad = 7.0;
+    let dot = 6.0;
+    let gap = 5.0;
+    let w = pad + dot + gap + text_w + pad;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+    let bg = egui::Color32::from_rgba_unmultiplied(0xe9, 0x19, 0x16, (a * 235.0) as u8);
+    ui.painter().rect_filled(rect, 4.0, bg);
+    let white = egui::Color32::from_white_alpha((a * 255.0) as u8);
+    ui.painter()
+        .circle_filled(egui::pos2(rect.min.x + pad + dot / 2.0, rect.center().y), 3.0, white);
+    ui.painter().text(
+        egui::pos2(rect.min.x + pad + dot + gap, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "LIVE",
+        font,
+        white,
+    );
+}
+
+fn paint_play(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let pts = vec![
+        egui::pos2(r.min.x + r.width() * 0.18, r.min.y),
+        egui::pos2(r.max.x, r.center().y),
+        egui::pos2(r.min.x + r.width() * 0.18, r.max.y),
+    ];
+    p.add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+}
+
+fn paint_pause(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let w = r.width() * 0.3;
+    p.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())), 1.0, c);
+    p.rect_filled(
+        egui::Rect::from_min_size(egui::pos2(r.max.x - w, r.min.y), egui::vec2(w, r.height())),
+        1.0,
+        c,
+    );
+}
+
+fn paint_speaker(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let body = egui::Rect::from_min_size(
+        egui::pos2(r.min.x, r.center().y - r.height() * 0.18),
+        egui::vec2(r.width() * 0.24, r.height() * 0.36),
+    );
+    p.rect_filled(body, 1.0, c);
+    let pts = vec![
+        egui::pos2(body.max.x, body.min.y),
+        egui::pos2(r.min.x + r.width() * 0.56, r.min.y),
+        egui::pos2(r.min.x + r.width() * 0.56, r.max.y),
+        egui::pos2(body.max.x, body.max.y),
+    ];
+    p.add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+    let cx = r.min.x + r.width() * 0.6;
+    for rad in [0.2_f32, 0.32] {
+        let rr = r.width() * rad;
+        let mut line = Vec::new();
+        for k in 0..=6 {
+            let ang = -0.7 + 1.4 * (k as f32 / 6.0);
+            line.push(egui::pos2(cx + rr * ang.cos(), r.center().y + rr * ang.sin()));
+        }
+        p.add(egui::Shape::line(line, egui::Stroke::new(1.5_f32, c)));
+    }
+}
+
+fn paint_fullscreen(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let l = r.width().min(r.height()) * 0.34;
+    let corners = [
+        (r.min, 1.0_f32, 1.0_f32),
+        (egui::pos2(r.max.x, r.min.y), -1.0_f32, 1.0_f32),
+        (egui::pos2(r.min.x, r.max.y), 1.0_f32, -1.0_f32),
+        (egui::pos2(r.max.x, r.max.y), -1.0_f32, -1.0_f32),
+    ];
+    for (c0, dx, dy) in corners {
+        p.line_segment([c0, egui::pos2(c0.x + dx * l, c0.y)], egui::Stroke::new(1.6_f32, c));
+        p.line_segment([c0, egui::pos2(c0.x, c0.y + dy * l)], egui::Stroke::new(1.6_f32, c));
+    }
+}
+
+fn vlc_path() -> Option<String> {
+    if let Ok(p) = std::env::var("EG_VLC") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    for p in [
+        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+fn play_url(url: &str) -> Result<(), String> {
+    let vlc = vlc_path().ok_or_else(|| "VLC not found. Install VLC or set EG_VLC to vlc.exe".to_string())?;
+    std::process::Command::new(vlc)
+        .arg("--one-instance")
+        .arg("--no-video-title-show")
+        .arg("--network-caching=1500")
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("Could not launch VLC: {}", e))?;
+    Ok(())
+}
+
+struct CatRow {
+    kind: Kind,
+    id: String,
+    name: String,
+}
+
+#[derive(Default)]
+struct Msg {
+    logged_in: Option<(String, Vec<CatRow>)>,
+    items: Option<Vec<Item>>,
+    play: Option<String>,
+    error: Option<String>,
+}
+
+struct App {
+    server: String,
+    user: String,
+    pass: String,
+    live_format: String,
+    status: String,
+    cats: Vec<CatRow>,
+    items: Vec<Item>,
+    kind: Kind,
+    cat: Option<String>,
+    selected: Option<usize>,
+    rx: Option<Receiver<Msg>>,
+    client: Option<Xtream>,
+    side_width: Option<f32>,
+    width_applied: bool,
+    player: video::Player,
+    autostart: bool,
+    autoplay: Option<String>,
+    fullscreen: bool,
+    muted: bool,
+    pre_mute_vol: i32,
+    open_live: bool,
+    open_vod: bool,
+    open_series: bool,
+    open_cats: std::collections::HashSet<String>,
+    now_playing: String,
+    /// Item id of the current stream, so presence can report *what* is on.
+    playing_id: String,
+    show_settings: bool,
+    wizard: bool,
+    vol_reapply: u32,
+    prev_lbtn: bool,
+    last_click: f64,
+    bright: f32,
+    contrast: f32,
+    gamma: f32,
+
+    // --- presence (who else is watching on the shared line) ---
+    /// Display name of whoever is at this install, e.g. "Peter". Empty means
+    /// not chosen yet, and presence stays off until it is.
+    profile: String,
+    device_id: String,
+    presence_url: String,
+    presence_token: String,
+    /// id -> display name, refreshed from the worker so adding a friend does
+    /// not need a new exe.
+    profiles: Vec<(String, String)>,
+    shared: Arc<Mutex<Shared>>,
+    roster: Arc<Mutex<Roster>>,
+    presence_thread: bool,
+    /// Profile as last reported to the worker, so a change can be pushed.
+    reported_profile: String,
+}
+
+fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
+    c.as_ref().map(|c| Xtream {
+        scheme: c.scheme.clone(),
+        host: c.host.clone(),
+        port: c.port,
+        user: c.user.clone(),
+        pass: c.pass.clone(),
+        timeout: c.timeout,
+    })
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let mut cfg = load_config();
+
+        // Env overrides win, matching EG_SERVER / EG_USER / EG_PASS.
+        let env_or = |key: &str, fallback: &str| -> String {
+            std::env::var(key)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let user = env_or("EG_USER", &cfg.user);
+        let pass = env_or("EG_PASS", &cfg.pass);
+        let server = env_or(
+            "EG_SERVER",
+            if cfg.server.is_empty() { DEFAULT_SERVER } else { &cfg.server },
+        );
+        let live_format = env_or("EG_FORMAT", if cfg.format.is_empty() { "ts" } else { &cfg.format });
+        let profile = env_or("EG_PROFILE", &cfg.profile);
+        let presence_url = env_or("EG_PRESENCE_URL", &cfg.presence_url);
+        let presence_token = env_or("EG_PRESENCE_TOKEN", &cfg.presence_token);
+
+        // A device id must survive restarts: it is the KV key suffix, so a new
+        // one every launch would leave ghost entries in the roster for a full
+        // TTL. Generated once, then persisted.
+        //
+        // Note that only the generated id is written back here. Environment
+        // variables are per-run overrides and are deliberately not persisted -
+        // the config file holds what the wizard and settings dialog saved.
+        let device_id = if cfg.device_id.is_empty() {
+            let id = presence::new_device_id();
+            cfg.device_id = id.clone();
+            save_config(&cfg);
+            id
+        } else {
+            cfg.device_id.clone()
+        };
+
+        let autostart = !user.is_empty() && !pass.is_empty();
+
+        let shared = Arc::new(Mutex::new(Shared {
+            url: presence_url.clone(),
+            token: presence_token.clone(),
+            profile: profile.clone(),
+            device_id: device_id.clone(),
+            device: presence::device_name(),
+            server: server.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+            ..Default::default()
+        }));
+
+        App {
+            server,
+            user,
+            pass,
+            live_format,
+            status: "Not connected".to_string(),
+            cats: Vec::new(),
+            items: Vec::new(),
+            kind: Kind::Live,
+            cat: None,
+            selected: None,
+            rx: None,
+            client: None,
+            side_width: None,
+            width_applied: false,
+            player: video::Player::new(),
+            autostart,
+            autoplay: std::env::var("EG_AUTOPLAY").ok().filter(|s| !s.is_empty()),
+            fullscreen: false,
+            muted: false,
+            pre_mute_vol: 100,
+            open_live: true,
+            open_vod: false,
+            open_series: false,
+            open_cats: std::collections::HashSet::new(),
+            now_playing: String::new(),
+            playing_id: String::new(),
+            show_settings: false,
+            wizard: !autostart,
+            vol_reapply: 0,
+            prev_lbtn: false,
+            last_click: 0.0,
+            bright: 1.0,
+            contrast: 1.0,
+            gamma: 1.0,
+            profile,
+            device_id,
+            presence_url,
+            presence_token,
+            profiles: presence::DEFAULT_PROFILES
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect(),
+            shared,
+            roster: Arc::new(Mutex::new(Roster::default())),
+            presence_thread: false,
+            reported_profile: String::new(),
+        }
+    }
+}
+
+impl App {
+    fn spawn_login(&mut self) {
+        let server = self.server.clone();
+        let user = self.user.clone();
+        let pass = self.pass.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.status = "Connecting...".to_string();
+        thread::spawn(move || {
+            let mut msg = Msg::default();
+            let result = Xtream::new(&server, &user, &pass).and_then(|c| {
+                let ui = c.authenticate()?;
+                let mut rows = Vec::new();
+                for (kind, cats) in [
+                    (Kind::Live, c.live_categories()),
+                    (Kind::Vod, c.vod_categories()),
+                    (Kind::Series, c.series_categories()),
+                ] {
+                    if let Ok(list) = cats {
+                        for cat in list {
+                            rows.push(CatRow { kind, id: cat.id, name: cat.name });
+                        }
+                    }
+                }
+                Ok((ui, rows))
+            });
+            match result {
+                Ok((ui, rows)) => {
+                    let info = format!(
+                        "{} | status={} | exp={} | max conn={}",
+                        ui.get("username").and_then(|v| v.as_str()).unwrap_or(&user),
+                        ui.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        ui.get("exp_date").and_then(|v| v.as_str()).unwrap_or("n/a"),
+                        ui.get("max_connections").and_then(|v| v.as_str()).unwrap_or("?")
+                    );
+                    msg.logged_in = Some((info, rows));
+                }
+                Err(e) => msg.error = Some(e),
+            }
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn spawn_items(&mut self, kind: Kind, cat: Option<String>) {
+        let client = match clone_client(&self.client) {
+            Some(c) => c,
+            None => return,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.status = format!("Loading {}...", kind.label());
+        thread::spawn(move || {
+            let mut msg = Msg::default();
+            match client.category_items(kind, cat.as_deref()) {
+                Ok(items) => msg.items = Some(items),
+                Err(e) => msg.error = Some(e),
+            }
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn spawn_play(&mut self, kind: Kind, item: Item) {
+        let client = match clone_client(&self.client) {
+            Some(c) => c,
+            None => return,
+        };
+        let fmt = self.live_format.clone();
+        self.now_playing = item.name.clone();
+        self.playing_id = item.id.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.status = format!("Preparing {}...", item.name);
+        thread::spawn(move || {
+            let mut msg = Msg::default();
+            match client.play_url(kind, &item, &fmt) {
+                Ok(url) => msg.play = Some(url),
+                Err(e) => msg.error = Some(e),
+            }
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn pump(&mut self) {
+        let received = match &self.rx {
+            Some(rx) => rx.try_recv().ok(),
+            None => None,
+        };
+        if let Some(msg) = received {
+            self.rx = None;
+            let mut load_live = false;
+            if let Some((info, rows)) = msg.logged_in {
+                self.status = info;
+                self.wizard = false;
+                save_config(&self.config_snapshot());
+                self.cats = rows;
+                self.side_width = None;
+                self.width_applied = false;
+                if let Ok(c) = Xtream::new(&self.server, &self.user, &self.pass) {
+                    self.client = Some(c);
+                }
+                self.kind = Kind::Live;
+                load_live = true;
+            }
+            if let Some(items) = msg.items {
+                self.status = format!("{} item(s)", items.len());
+                self.items = items;
+                self.selected = None;
+                if let Some(id) = self.autoplay.take() {
+                    if let Some(i) = self.items.iter().position(|it| it.id == id) {
+                        let kind = self.kind;
+                        let item = self.items[i].clone();
+                        self.spawn_play(kind, item);
+                    }
+                }
+            }
+            if let Some(url) = msg.play {
+                match self.player.play(&url) {
+                    Ok(_) => {
+                        self.status = "Playing".to_string();
+                        self.vol_reapply = 60;
+                        // Only now is there genuinely a connection on the
+                        // panel, so this is the honest moment to announce.
+                        self.presence_start();
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            if let Some(e) = msg.error {
+                self.status = e;
+            }
+            if load_live {
+                self.spawn_items(Kind::Live, None);
+            }
+        }
+    }
+
+    /* --------------------------------------------------------- presence ---- */
+
+    /// The on-disk representation, built from current UI state.
+    fn config_snapshot(&self) -> Config {
+        Config {
+            server: self.server.clone(),
+            user: self.user.clone(),
+            pass: self.pass.clone(),
+            format: self.live_format.clone(),
+            profile: self.profile.clone(),
+            device_id: self.device_id.clone(),
+            presence_url: self.presence_url.clone(),
+            presence_token: self.presence_token.clone(),
+        }
+    }
+
+    /// The lowercase id the worker knows us by, e.g. "peter".
+    fn profile_id(&self) -> String {
+        self.profiles
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(&self.profile))
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| self.profile.to_lowercase())
+    }
+
+    fn presence_ready(&self) -> bool {
+        !self.presence_url.is_empty()
+            && !self.presence_token.is_empty()
+            && !self.profile.is_empty()
+            && !self.device_id.is_empty()
+    }
+
+    fn presence_roster(&self) -> Roster {
+        self.roster.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    fn ensure_presence_thread(&mut self) {
+        if self.presence_thread {
+            return;
+        }
+        self.presence_thread = true;
+        presence::spawn(Arc::clone(&self.shared), Arc::clone(&self.roster));
+    }
+
+    /// Push identity and playback state down to the presence thread. Cheap
+    /// enough to run every frame; it is one mutex lock and a few clones.
+    fn presence_sync(&mut self) {
+        let state = if self.player.is_playing() { "playing" } else { "paused" };
+        let id = self.profile_id();
+        if !self.reported_profile.is_empty() && self.reported_profile != id {
+            if let Ok(mut g) = self.shared.lock() {
+                g.stale_profile = self.reported_profile.clone();
+            }
+        }
+        if let Ok(mut g) = self.shared.lock() {
+            g.enabled = self.presence_ready();
+            g.url = self.presence_url.clone();
+            g.token = self.presence_token.clone();
+            g.profile = id.clone();
+            g.device_id = self.device_id.clone();
+            g.device = presence::device_name();
+            g.state = state.to_string();
+            g.server = self.server.clone();
+            g.user = self.user.clone();
+            g.pass = self.pass.clone();
+        }
+        self.reported_profile = id;
+    }
+
+    /// A stream just started, so this install now holds a panel connection.
+    fn presence_start(&mut self) {
+        let kind = match self.kind {
+            Kind::Live => "live",
+            Kind::Vod => "vod",
+            Kind::Series => "series",
+        };
+        if let Ok(mut g) = self.shared.lock() {
+            // Zapping between channels keeps the original start time so the
+            // "watching for" clock does not reset on every channel change.
+            if !g.active {
+                g.since = presence::now_ms();
+            }
+            g.active = true;
+            g.state = "playing".to_string();
+            g.stream_kind = kind.to_string();
+            g.stream_id = self.playing_id.clone();
+            g.stream_name = self.now_playing.clone();
+        }
+    }
+
+    /// "Watching as" dropdown - shared by the wizard, the top bar and settings.
+    fn profile_combo(&mut self, ui: &mut egui::Ui, id: &str, width: f32) {
+        let list = self.profiles.clone();
+        let selected = if self.profile.is_empty() {
+            "Select…".to_string()
+        } else {
+            self.profile.clone()
+        };
+        egui::ComboBox::from_id_source(id)
+            .width(width)
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for (_, name) in list.iter() {
+                    ui.selectable_value(&mut self.profile, name.clone(), name);
+                }
+            });
+    }
+
+    fn dashboard_url(&self) -> String {
+        if self.presence_url.is_empty() {
+            return String::new();
+        }
+        format!(
+            "{}/?key={}",
+            self.presence_url.trim_end_matches('/'),
+            self.presence_token
+        )
+    }
+
+    /// The presence pill in the top bar.
+    fn presence_pill_ui(&mut self, ui: &mut egui::Ui) {
+        let me = self.profile_id();
+
+        if !self.presence_ready() {
+            let hint = if self.presence_url.is_empty() || self.presence_token.is_empty() {
+                "Presence not set up"
+            } else {
+                "Pick who's watching"
+            };
+            pill_resp(ui, T_MUTED, hint).on_hover_text(
+                "Set presence_url, presence_token and profile in %APPDATA%\\EagleGlass\\config.txt \
+                 (or EG_PRESENCE_URL / EG_PRESENCE_TOKEN / EG_PROFILE) to see who else is on the account.",
+            );
+            return;
+        }
+
+        let roster = self.presence_roster();
+
+        if let Some(err) = &roster.error {
+            pill_resp(ui, T_DANGER, "Presence unreachable").on_hover_text(err.clone());
+            return;
+        }
+        if !roster.fresh() {
+            pill_resp(ui, T_MUTED, "Checking who's watching…");
+            return;
+        }
+
+        let others = roster.others(&me);
+        let mine = roster.my_devices(&me);
+        let maxed = roster.max_connections > 0 && roster.active_cons >= roster.max_connections;
+
+        let (color, text) = if roster.unaccounted > 0 {
+            (
+                T_DANGER,
+                format!(
+                    "{} unknown watcher{}",
+                    roster.unaccounted,
+                    if roster.unaccounted == 1 { "" } else { "s" }
+                ),
+            )
+        } else if maxed {
+            (
+                T_DANGER,
+                format!("{}/{} connections in use", roster.active_cons, roster.max_connections),
+            )
+        } else if !others.is_empty() {
+            let mut names: Vec<String> = others.iter().map(|w| w.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            let label = if names.len() > 2 {
+                format!("{} +{}", names[..2].join(", "), names.len() - 2)
+            } else {
+                names.join(", ")
+            };
+            (T_ACCENT, format!("{} watching · {}", names.len(), label))
+        } else if mine > 1 {
+            (T_ACCENT, format!("You're on {} devices", mine))
+        } else if roster.max_connections > 0 {
+            (
+                T_MUTED,
+                format!("Only you · {}/{}", roster.active_cons, roster.max_connections),
+            )
+        } else {
+            (T_MUTED, "Only you".to_string())
+        };
+
+        let mut hover = String::new();
+        if roster.unaccounted > 0 {
+            hover.push_str(&format!(
+                "The panel reports {} live connection{} but only {} of our device{} {} checked in — someone may be watching without us.\n\n",
+                roster.active_cons,
+                if roster.active_cons == 1 { "" } else { "s" },
+                roster.watchers.len(),
+                if roster.watchers.len() == 1 { "" } else { "s" },
+                if roster.watchers.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        if roster.watchers.is_empty() {
+            hover.push_str("Nobody is checked in.\n");
+        }
+        for w in &roster.watchers {
+            let who = if w.profile == me {
+                format!("{} (you)", w.name)
+            } else {
+                w.name.clone()
+            };
+            let chan = if w.stream_name.is_empty() {
+                "no stream"
+            } else {
+                w.stream_name.as_str()
+            };
+            let mut line = format!("{} · {} · {}", who, chan, presence::human_duration(w.watching_seconds));
+            if w.state == "paused" {
+                line.push_str(" · paused");
+            }
+            // A stale heartbeat means their client is struggling, not that they
+            // are gone - worth showing rather than silently hiding.
+            if w.age_seconds > 90 {
+                line.push_str(&format!(" · last seen {}s ago", w.age_seconds));
+            }
+            line.push_str(&format!(" · on {}", w.device));
+            hover.push_str(&line);
+            hover.push('\n');
+        }
+        if roster.max_connections > 0 {
+            hover.push_str(&format!(
+                "\nConnections: {}/{} in use",
+                roster.active_cons, roster.max_connections
+            ));
+        }
+        hover.push_str("\n\nClick to open the dashboard.");
+
+        let url = self.dashboard_url();
+        let resp = pill_resp(ui, color, &text).on_hover_text(hover);
+        let resp = ui.interact(resp.rect, resp.id, egui::Sense::click());
+        if resp.clicked() && !url.is_empty() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    }
+
+    /// Top bar identity control: who is watching, and who else is on.
+    fn presence_top_ui(&mut self, ui: &mut egui::Ui) {
+        let list = self.profiles.clone();
+        if !list.is_empty() {
+            ui.label(egui::RichText::new("Watching as").size(11.0).color(T_MUTED));
+            self.profile_combo(ui, "profile_top", 96.0);
+        }
+        self.presence_pill_ui(ui);
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.fullscreen = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+    fn toggle_mute(&mut self) {
+        if self.muted {
+            self.muted = false;
+            self.player.set_volume(self.pre_mute_vol.max(1));
+        } else {
+            self.pre_mute_vol = self.player.volume().max(1);
+            self.muted = true;
+            self.player.set_volume(0);
+        }
+    }
+
+    fn wizard_ui(&mut self, ctx: &egui::Context) {
+        let connecting = self.rx.is_some();
+        let submit = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut do_login = false;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.16).max(24.0));
+                egui::Frame::none()
+                    .fill(T_SURFACE)
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(22.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(320.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("Welcome to Eagle Glass").size(20.0).strong(),
+                            );
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new("Enter your Xtream panel details to get started.")
+                                    .size(11.5)
+                                    .color(T_MUTED),
+                            );
+                            ui.add_space(16.0);
+                            let m = egui::Margin::symmetric(6.0, 5.0);
+                            ui.label(egui::RichText::new("Server").size(10.5).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.server)
+                                    .desired_width(320.0)
+                                    .margin(m)
+                                    .hint_text("http://host:port"),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Username").size(10.5).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.user)
+                                    .desired_width(320.0)
+                                    .margin(m),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Password").size(10.5).color(T_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pass)
+                                    .desired_width(320.0)
+                                    .password(true)
+                                    .margin(m),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Watching as").size(10.5).color(T_MUTED));
+                            self.profile_combo(ui, "profile_wizard", 320.0);
+                            ui.add_space(16.0);
+                            let picked = !self.profile.is_empty();
+                            let label = if connecting { "Connecting..." } else { "Connect" };
+                            ui.add_enabled_ui(picked, |ui| {
+                                if ui.add_sized([320.0, 32.0], egui::Button::new(label)).clicked()
+                                    && !connecting
+                                {
+                                    do_login = true;
+                                }
+                            });
+                            if !picked {
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "Choose who's watching so the others can see if you're on.",
+                                        )
+                                        .size(11.0)
+                                        .color(T_MUTED),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            if !self.status.is_empty()
+                                && self.status != "Not connected"
+                                && !self.status.starts_with("Connecting")
+                            {
+                                ui.add_space(10.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(self.status.clone())
+                                            .size(11.0)
+                                            .color(T_DANGER),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                    });
+            });
+        });
+        if do_login || (submit && !connecting && !self.profile.is_empty()) {
+            self.spawn_login();
+        }
+    }
+
+    fn apply_bounds(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let ppp = ctx.pixels_per_point();
+        self.player
+            .set_bounds(rect.min.x * ppp, rect.min.y * ppp, rect.width() * ppp, rect.height() * ppp);
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Ok(handle) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
+                self.player.set_parent(w.hwnd.get() as *mut std::ffi::c_void);
+            }
+        }
+        if self.autostart {
+            self.autostart = false;
+            if !self.user.is_empty() && !self.pass.is_empty() {
+                self.spawn_login();
+            }
+        }
+        self.pump();
+
+        let f11 = ctx.input(|i| i.key_pressed(egui::Key::F11));
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if f11 {
+            let on = !self.fullscreen;
+            self.set_fullscreen(ctx, on);
+        }
+        if self.fullscreen && esc {
+            self.set_fullscreen(ctx, false);
+        }
+        let lbtn = video::left_button_down();
+        if lbtn && !self.prev_lbtn && self.player.cursor_over_video() {
+            let t = ctx.input(|i| i.time);
+            if t - self.last_click < 0.45 {
+                let on = !self.fullscreen;
+                self.set_fullscreen(ctx, on);
+                self.last_click = 0.0;
+            } else {
+                self.last_click = t;
+            }
+        }
+        self.prev_lbtn = lbtn;
+
+        self.ensure_presence_thread();
+        self.presence_sync();
+
+        if self.player.is_playing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(25));
+        } else if self.presence_ready() {
+            // Idle the UI is not repainted by egui, but the presence pill still
+            // needs to refresh when someone else starts watching.
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+        }
+
+        if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.player.pause_toggle();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                self.toggle_mute();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                let v = (self.player.volume() + 5).min(100);
+                self.player.set_volume(v);
+                self.muted = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                let v = (self.player.volume() - 5).max(0);
+                self.player.set_volume(v);
+            }
+        }
+        if self.fullscreen {
+            let mut vr: Option<egui::Rect> = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+                .show(ctx, |ui| {
+                    let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+                    if resp.double_clicked() {
+                        self.set_fullscreen(ctx, false);
+                    }
+                    vr = Some(rect);
+                });
+            if let Some(rect) = vr {
+                self.apply_bounds(ctx, rect);
+            }
+            return;
+        }
+
+        let initial_vol = self.player.volume();
+        let mut vol_val = initial_vol;
+        let mut act_pause = false;
+        let mut act_mute = false;
+        let mut want_fs = false;
+        let playing = self.player.is_playing();
+
+        if self.wizard && self.client.is_none() {
+            self.wizard_ui(ctx);
+            return;
+        }
+
+        if self.side_width.is_none() && !self.cats.is_empty() {
+            let font = egui::FontId::proportional(14.0);
+            let mut maxw: f32 = 120.0;
+            for c in &self.cats {
+                let g = ctx.fonts(|f| f.layout_no_wrap(c.name.clone(), font.clone(), egui::Color32::WHITE));
+                maxw = maxw.max(g.size().x);
+            }
+            for kind in [Kind::Live, Kind::Vod, Kind::Series] {
+                let n = self.cats.iter().filter(|c| c.kind == kind).count();
+                let label = format!("{} ({})", kind.label(), n);
+                let g = ctx.fonts(|f| f.layout_no_wrap(label, font.clone(), egui::Color32::WHITE));
+                maxw = maxw.max(g.size().x);
+            }
+            self.side_width = Some((maxw + 26.0 + 44.0).clamp(240.0, 420.0));
+        }
+
+        egui::TopBottomPanel::top("top")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(T_TOP))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let connecting = self.rx.is_some();
+                    let (col, text) = if self.client.is_some() {
+                        (T_SUCCESS, format!("Connected · {}", self.user))
+                    } else if connecting {
+                        (T_ACCENT, "Connecting…".to_string())
+                    } else {
+                        (T_DANGER, "Not connected".to_string())
+                    };
+                    pill(ui, col, &text);
+                    ui.add_space(4.0);
+                    self.presence_top_ui(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_sized([34.0, 26.0], egui::Button::new("⚙")).clicked() {
+                            self.show_settings = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+            });
+
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(T_TOP))
+            .show(ctx, |ui| {
+                ui.label(self.status.clone());
+            });
+
+        let mut cat_action: Option<(Kind, Option<String>)> = None;
+        let mut switch_kind: Option<Kind> = None;
+        let mut play_side: Option<(Kind, usize, Item)> = None;
+        let side_w = self.side_width.unwrap_or(280.0);
+        let apply_exact = !self.width_applied && self.side_width.is_some();
+        let mut open_cats = std::mem::take(&mut self.open_cats);
+        {
+            let cats = &self.cats;
+            let items = &self.items;
+            let current = self.cat.clone();
+            let cur_kind = self.kind;
+            let selected = self.selected;
+            let frame = egui::Frame::side_top_panel(&ctx.style()).fill(T_SIDEBAR);
+            let panel = if apply_exact {
+                egui::SidePanel::left("cats").exact_width(side_w).frame(frame.clone())
+            } else {
+                egui::SidePanel::left("cats")
+                    .resizable(true)
+                    .default_width(side_w)
+                    .width_range(200.0..=440.0)
+                    .frame(frame.clone())
+            };
+            let mut open = [self.open_live, self.open_vod, self.open_series];
+            panel.show(ctx, |ui| {
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(6.0);
+                    for (i, kind) in [Kind::Live, Kind::Vod, Kind::Series].iter().enumerate() {
+                        let rows: Vec<&CatRow> = cats.iter().filter(|c| c.kind == *kind).collect();
+                        let total = if *kind == cur_kind { items.len() } else { 0 };
+                        if side_header(ui, open[i], kind.label(), total) {
+                            open[i] = !open[i];
+                            if open[i] && *kind != cur_kind {
+                                switch_kind = Some(*kind);
+                            }
+                        }
+                        if open[i] {
+                            if side_row(ui, current.is_none() && *kind == cur_kind, "All channels") {
+                                cat_action = Some((*kind, None));
+                                if *kind != cur_kind {
+                                    switch_kind = Some(*kind);
+                                }
+                            }
+                            for r in rows {
+                                let expanded = open_cats.contains(&r.id);
+                                let count = if *kind == cur_kind {
+                                    items.iter().filter(|it| it.cat == r.id).count()
+                                } else {
+                                    0
+                                };
+                                let cat_sel = current.as_deref() == Some(r.id.as_str()) && *kind == cur_kind;
+                                if cat_node(ui, expanded, cat_sel, &r.name, count) {
+                                    if expanded {
+                                        open_cats.remove(&r.id);
+                                    } else {
+                                        open_cats.insert(r.id.clone());
+                                        if *kind != cur_kind {
+                                            switch_kind = Some(*kind);
+                                        }
+                                        cat_action = Some((*kind, Some(r.id.clone())));
+                                    }
+                                }
+                                if expanded && *kind == cur_kind {
+                                    for (idx, it) in items.iter().enumerate() {
+                                        if it.cat != r.id {
+                                            continue;
+                                        }
+                                        if side_chan(ui, selected == Some(idx), &it.name) {
+                                            play_side = Some((*kind, idx, it.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+            self.open_live = open[0];
+            self.open_vod = open[1];
+            self.open_series = open[2];
+        }
+        self.open_cats = open_cats;
+        if apply_exact {
+            self.width_applied = true;
+        }
+        if let Some(kind) = switch_kind {
+            if kind != self.kind {
+                self.kind = kind;
+                self.spawn_items(kind, None);
+            }
+        }
+        if let Some((kind, cat)) = cat_action {
+            self.kind = kind;
+            self.cat = cat.clone();
+        }
+        if let Some((kind, idx, item)) = play_side {
+            self.selected = Some(idx);
+            self.spawn_play(kind, item);
+        }
+
+        let selected = self.selected;
+        let mut video_rect: Option<egui::Rect> = None;
+
+        let title = self.now_playing.clone();
+        let alpha = 1.0_f32;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if !title.is_empty() {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&title).size(13.0).color(T_TEXT))
+                            .truncate(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if playing {
+                        live_badge(ui, 1.0);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            let avail = ui.available_size();
+            let mut vh = avail.x * 9.0 / 16.0;
+            let max_vh = (avail.y - 46.0).max(120.0);
+            if vh > max_vh {
+                vh = max_vh;
+            }
+            let vw = (vh * 16.0 / 9.0).min(avail.x);
+            let (vrect, vresp) = ui.allocate_exact_size(
+                egui::vec2(avail.x, vh.max(80.0)),
+                egui::Sense::click(),
+            );
+            ui.painter().rect_filled(vrect, 0.0, egui::Color32::BLACK);
+            let video = egui::Rect::from_center_size(vrect.center(), egui::vec2(vw, vh));
+            video_rect = Some(video);
+            if vresp.double_clicked() {
+                want_fs = true;
+            }
+            if vresp.hovered() {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll.abs() > 0.0 {
+                    vol_val = (vol_val + (scroll / 40.0) as i32).clamp(0, 100);
+                }
+            }
+
+            let (bar, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 40.0),
+                egui::Sense::hover(),
+            );
+            ui.add_space(6.0);
+            let cy = bar.center().y;
+            let col = egui::Color32::from_white_alpha((alpha * 235.0) as u8);
+            let hov = egui::Color32::from_white_alpha((alpha * 26.0) as u8);
+
+            let btn = egui::Rect::from_center_size(egui::pos2(bar.min.x + 21.0, cy), egui::vec2(30.0, 30.0));
+            let r = ui.interact(btn, ui.id().with("pp"), egui::Sense::click());
+            if r.hovered() {
+                ui.painter().rect_filled(btn, 5.0, hov);
+            }
+            if playing {
+                paint_pause(ui.painter(), btn.shrink(9.0), col);
+            } else {
+                paint_play(ui.painter(), btn.shrink(9.0), col);
+            }
+            if r.clicked() {
+                act_pause = true;
+            }
+
+            let vbtn = egui::Rect::from_center_size(egui::pos2(bar.min.x + 58.0, cy), egui::vec2(26.0, 26.0));
+            let vr = ui.interact(vbtn, ui.id().with("volicon"), egui::Sense::click());
+            if vr.hovered() {
+                ui.painter().rect_filled(vbtn, 5.0, hov);
+            }
+            let vcol = if vol_val == 0 {
+                egui::Color32::from_white_alpha((alpha * 120.0) as u8)
+            } else {
+                col
+            };
+            paint_speaker(ui.painter(), vbtn.shrink(6.0), vcol);
+            if vr.clicked() {
+                act_mute = true;
+            }
+
+            let vs = egui::Rect::from_min_size(egui::pos2(bar.min.x + 76.0, cy - 9.0), egui::vec2(120.0, 18.0));
+            let vsr = ui.interact(vs, ui.id().with("vol"), egui::Sense::click_and_drag());
+            let track = egui::Rect::from_center_size(vs.center(), egui::vec2(vs.width(), 4.0));
+            ui.painter().rect_filled(track, 2.0, egui::Color32::from_white_alpha((alpha * 70.0) as u8));
+            let mut nv = vol_val;
+            if let Some(p) = vsr.interact_pointer_pos() {
+                nv = (((p.x - track.min.x) / track.width()).clamp(0.0, 1.0) * 100.0).round() as i32;
+            }
+            let fw = track.width() * (nv as f32 / 100.0);
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(track.min, egui::vec2(fw, track.height())),
+                2.0,
+                egui::Color32::from_white_alpha((alpha * 235.0) as u8),
+            );
+            ui.painter()
+                .circle_filled(egui::pos2(track.min.x + fw, track.center().y), 5.0, col);
+            if nv != vol_val {
+                vol_val = nv;
+            }
+
+            let fs = egui::Rect::from_center_size(egui::pos2(bar.max.x - 21.0, cy), egui::vec2(30.0, 30.0));
+            let fr = ui.interact(fs, ui.id().with("fs"), egui::Sense::click());
+            if fr.hovered() {
+                ui.painter().rect_filled(fs, 5.0, hov);
+            }
+            paint_fullscreen(ui.painter(), fs.shrink(9.0), col);
+            if fr.clicked() {
+                want_fs = true;
+            }
+            let _ = video;
+        });
+
+        if act_pause {
+            self.player.pause_toggle();
+        }
+        if act_mute {
+            self.toggle_mute();
+        }
+        if vol_val != initial_vol {
+            self.player.set_volume(vol_val);
+            if vol_val > 0 {
+                self.muted = false;
+            }
+        }
+        if self.vol_reapply > 0 && playing {
+            self.player.set_volume(self.player.volume());
+            self.player.set_picture(self.bright, self.contrast, self.gamma);
+            self.vol_reapply -= 1;
+            ctx.request_repaint();
+        }
+        if want_fs {
+            self.set_fullscreen(ctx, true);
+        }
+        if self.show_settings {
+            self.player.set_bounds(0.0, 0.0, 1.0, 1.0);
+        } else if let Some(rect) = video_rect {
+            self.apply_bounds(ctx, rect);
+        }
+
+        if self.show_settings {
+            let m = egui::Margin::symmetric(6.0, 5.0);
+            let mut open = true;
+            egui::Window::new("Settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(320.0);
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Server").size(11.0).color(T_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(320.0).margin(m));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Username").size(11.0).color(T_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(320.0).margin(m));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Password").size(11.0).color(T_MUTED));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pass)
+                            .desired_width(320.0)
+                            .password(true)
+                            .margin(m),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Live format").size(11.0).color(T_MUTED));
+                        egui::ComboBox::from_id_source("fmt")
+                            .width(80.0)
+                            .selected_text(self.live_format.clone())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.live_format, "ts".into(), "ts");
+                                ui.selectable_value(&mut self.live_format, "m3u8".into(), "m3u8");
+                            });
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Picture (fix washed-out UHD / HDR)")
+                            .size(10.5)
+                            .color(T_MUTED),
+                    );
+                    ui.add_space(4.0);
+                    ui.spacing_mut().slider_width = 170.0;
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [72.0, 18.0],
+                            egui::Label::new(egui::RichText::new("Brightness").size(11.0)),
+                        );
+                        changed |= ui.add(egui::Slider::new(&mut self.bright, 0.5..=2.0)).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [72.0, 18.0],
+                            egui::Label::new(egui::RichText::new("Contrast").size(11.0)),
+                        );
+                        changed |= ui.add(egui::Slider::new(&mut self.contrast, 0.5..=2.0)).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [72.0, 18.0],
+                            egui::Label::new(egui::RichText::new("Gamma").size(11.0)),
+                        );
+                        changed |= ui.add(egui::Slider::new(&mut self.gamma, 0.5..=3.0)).changed();
+                    });
+                    if ui.button("Reset picture").clicked() {
+                        self.bright = 1.0;
+                        self.contrast = 1.0;
+                        self.gamma = 1.0;
+                        changed = true;
+                    }
+                    if changed {
+                        self.player.set_picture(self.bright, self.contrast, self.gamma);
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Presence — who else is on this line")
+                            .size(10.5)
+                            .color(T_MUTED),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Watching as").size(11.0).color(T_MUTED));
+                        self.profile_combo(ui, "profile_settings", 150.0);
+                    });
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Presence URL").size(11.0).color(T_MUTED));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.presence_url)
+                            .desired_width(320.0)
+                            .margin(m)
+                            .hint_text("https://eglass-presence.<sub>.workers.dev"),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Presence token").size(11.0).color(T_MUTED));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.presence_token)
+                            .desired_width(320.0)
+                            .password(true)
+                            .margin(m),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let url = self.dashboard_url();
+                        ui.add_enabled_ui(!url.is_empty(), |ui| {
+                            if ui.button("Open dashboard").clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                            }
+                        });
+                        if ui.button("Refresh").clicked() {
+                            if let Ok(mut g) = self.shared.lock() {
+                                g.force_poll = true;
+                            }
+                        }
+                    });
+                    if !self.presence_ready() {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Pick a name and fill in both presence fields to see the others.",
+                                )
+                                .size(10.5)
+                                .color(T_MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    let connecting = self.rx.is_some();
+                    let label = if connecting { "Connecting..." } else { "Connect" };
+                    if ui.add_sized([320.0, 30.0], egui::Button::new(label)).clicked() && !connecting {
+                        save_config(&self.config_snapshot());
+                        self.spawn_login();
+                        self.show_settings = false;
+                    }
+                });
+            if !open {
+                self.show_settings = false;
+            }
+        }
+
+        self.selected = selected;
+    }
+
+    /// Clearing on the way out means the others see you leave immediately
+    /// instead of waiting out the TTL. If the process is killed this never
+    /// runs, which is exactly why the worker also expires presence.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        presence::clear_on_exit(&self.shared);
+    }
+}
+
+fn parse_flags(args: &[String]) -> (String, String, String, Vec<String>) {
+    let mut server = std::env::var("EG_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
+    let mut user = std::env::var("EG_USER").unwrap_or_default();
+    let mut pass = std::env::var("EG_PASS").unwrap_or_default();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--server" if i + 1 < args.len() => { server = args[i + 1].clone(); i += 2; }
+            "--user" if i + 1 < args.len() => { user = args[i + 1].clone(); i += 2; }
+            "--pass" if i + 1 < args.len() => { pass = args[i + 1].clone(); i += 2; }
+            other => { rest.push(other.to_string()); i += 1; }
+        }
+    }
+    (server, user, pass, rest)
+}
+
+fn kind_from(s: &str) -> Option<Kind> {
+    match s {
+        "live" => Some(Kind::Live),
+        "vod" | "movie" | "movies" => Some(Kind::Vod),
+        "series" => Some(Kind::Series),
+        _ => None,
+    }
+}
+
+fn run_cli(server: String, user: String, pass: String, rest: Vec<String>) -> Result<(), String> {
+    let cmd = rest.first().map(|s| s.as_str()).unwrap_or("categories");
+
+    // The presence roster is about the shared worker, not the panel, so it must
+    // not require panel credentials to be present.
+    if cmd == "presence" {
+        return presence_cli(rest.get(1).map(|s| s.as_str()));
+    }
+
+    let client = Xtream::new(&server, &user, &pass)?;
+    match cmd {
+        "categories" => {
+            client.authenticate()?;
+            for (kind, cats) in [
+                (Kind::Live, client.live_categories()?),
+                (Kind::Vod, client.vod_categories()?),
+                (Kind::Series, client.series_categories()?),
+            ] {
+                println!("== {} ({}) ==", kind.label(), cats.len());
+                for c in cats {
+                    println!("  {:>7}  {}", c.id, c.name);
+                }
+            }
+        }
+        "list" => {
+            let kind = kind_from(rest.get(1).map(|s| s.as_str()).unwrap_or("live"))
+                .ok_or("usage: list <live|vod|series> [category_id]")?;
+            let cat = rest.get(2).map(|s| s.as_str());
+            client.authenticate()?;
+            for it in client.category_items(kind, cat)? {
+                println!("  {:>10}  {}", it.id, it.name);
+            }
+        }
+        "url" | "play" => {
+            let kind = kind_from(rest.get(1).map(|s| s.as_str()).unwrap_or("live"))
+                .ok_or("usage: url <live|vod|series> <id> [format]")?;
+            let id = rest.get(2).ok_or("missing id")?;
+            let fmt = rest.get(3).map(|s| s.as_str()).unwrap_or("ts");
+            let item = Item { id: id.clone(), name: String::new(), ext: String::new(), cat: String::new() };
+            let url = client.play_url(kind, &item, fmt)?;
+            println!("{}", url);
+            if cmd == "play" {
+                play_url(&url)?;
+            }
+        }
+        "m3u" => {
+            let out = rest.get(1).cloned().unwrap_or_else(|| "playlist.m3u".to_string());
+            let text = client.m3u_playlist()?;
+            std::fs::write(&out, text).map_err(|e| e.to_string())?;
+            println!("wrote {}", out);
+        }
+        "epg" => {
+            println!("{}", client.xmltv_url());
+        }
+        other => return Err(format!("unknown command: {}", other)),
+    }
+    Ok(())
+}
+
+/// `eglass.exe presence [watch|stop]` - check the shared roster without the GUI,
+/// and the quickest way to prove the worker is reachable.
+fn presence_cli(action: Option<&str>) -> Result<(), String> {
+    let mut cfg = load_config();
+    if cfg.device_id.is_empty() {
+        // The GUI generates this on first run; CLI use should not be a
+        // different device every time.
+        cfg.device_id = presence::new_device_id();
+        save_config(&cfg);
+    }
+    let url = std::env::var("EG_PRESENCE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.presence_url.clone());
+    let token = std::env::var("EG_PRESENCE_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.presence_token.clone());
+    let profile = std::env::var("EG_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.profile.clone());
+
+    if url.is_empty() || token.is_empty() {
+        return Err(
+            "presence_url and presence_token are not set. Add them to %APPDATA%\\EagleGlass\\config.txt"
+                .into(),
+        );
+    }
+    if profile.is_empty() {
+        return Err("profile is not set. Add e.g. `profile=Peter` to config.txt".into());
+    }
+
+    let pid = profile.to_lowercase();
+    let client = presence::Presence::new(&url, &token);
+
+    match action {
+        Some("watch") => {
+            let shared = Shared {
+                enabled: true,
+                url,
+                token,
+                profile: pid.clone(),
+                device_id: cfg.device_id.clone(),
+                device: presence::device_name(),
+                active: true,
+                state: "playing".to_string(),
+                stream_kind: "live".to_string(),
+                stream_id: "cli".to_string(),
+                stream_name: "CLI test stream".to_string(),
+                since: presence::now_ms(),
+                ..Default::default()
+            };
+            let r = client.heartbeat(&shared)?;
+            println!("{} checked in as \"{}\"\n", pid, presence::device_name());
+            print_roster(&r, &pid);
+        }
+        Some("stop") => {
+            client.idle(&pid, &cfg.device_id)?;
+            println!("{} cleared from the roster.", pid);
+        }
+        _ => {
+            let r = client.roster()?;
+            print_roster(&r, &pid);
+        }
+    }
+    Ok(())
+}
+
+fn print_roster(r: &Roster, me: &str) {
+    if let Some(err) = &r.error {
+        println!("error: {}", err);
+        return;
+    }
+    let account = if r.max_connections > 0 {
+        format!("connections {}/{}", r.active_cons, r.max_connections)
+    } else {
+        "connection limit not reported".to_string()
+    };
+    println!(
+        "{} · {} device(s) · {} watching",
+        account,
+        r.watchers.len(),
+        r.people()
+    );
+    if r.unaccounted > 0 {
+        println!(
+            "  ! {} connection(s) with no matching client - someone outside the group may be watching",
+            r.unaccounted
+        );
+    }
+    if r.watchers.is_empty() {
+        println!("  nobody is watching");
+        return;
+    }
+    for w in &r.watchers {
+        let who = if w.profile == me {
+            format!("{} (you)", w.name)
+        } else {
+            w.name.clone()
+        };
+        let chan = clip(&w.stream_name, 30);
+        println!(
+            "  {:<16} {:<30} {:>7}  {}{}",
+            who,
+            chan,
+            presence::human_duration(w.watching_seconds),
+            w.device,
+            if w.state == "paused" { "  [paused]" } else { "" }
+        );
+    }
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut)
+}
+
+#[cfg(windows)]
+fn detach_console() {    #[link(name = "kernel32")]
+    extern "system" {
+        fn FreeConsole() -> i32;
+    }
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}
+
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (server, user, pass, rest) = parse_flags(&args);
+
+    if !rest.is_empty() {
+        if let Err(e) = run_cli(server, user, pass, rest) {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    detach_console();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1600.0, 1030.0])
+            .with_min_inner_size([1000.0, 640.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Eagle Glass",
+        options,
+        Box::new(|cc| {
+            apply_theme(&cc.egui_ctx);
+            Ok(Box::new(App::default()))
+        }),
+    )
+}
