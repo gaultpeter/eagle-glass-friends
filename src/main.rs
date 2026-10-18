@@ -1,3 +1,4 @@
+mod launch;
 mod presence;
 mod video;
 mod xtream;
@@ -739,6 +740,9 @@ struct App {
     pictures: Vec<Picture>,
     picture_dirty: bool,
     picture_save_at: i64,
+    /// A channel the TV guide asked for, waiting until we can play it.
+    launch_request: Option<launch::PlayRequest>,
+    request_poll_at: i64,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -909,6 +913,9 @@ impl Default for App {
             pictures: start_pictures,
             picture_dirty: false,
             picture_save_at: 0,
+            // Whatever the guide page asked for before we were even running.
+            launch_request: startup_request().lock().ok().and_then(|mut s| s.take()),
+            request_poll_at: 0,
         }
     }
 }
@@ -1774,6 +1781,46 @@ impl App {
         }
     }
 
+    /// Pick up a request from the guide page, and act on it once we can.
+    ///
+    /// Polled rather than event-driven because the alternative on Windows is
+    /// subclassing the window to receive a message from the second instance, and
+    /// a stat check once a second is a much smaller thing to own.
+    fn poll_launch_request(&mut self, ctx: &egui::Context) {
+        let now = presence::now_ms();
+        if now - self.request_poll_at >= 1000 {
+            self.request_poll_at = now;
+            if let Some(req) = launch::take() {
+                match req {
+                    launch::Request::Focus => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    launch::Request::Play(p) => self.launch_request = Some(p),
+                }
+            }
+        }
+
+        let Some(req) = self.launch_request.clone() else {
+            return;
+        };
+        // Before the panel login there is nothing to resolve an id against, so
+        // the request waits rather than being dropped.
+        if self.client.is_none() {
+            self.status = format!("Open {} once the panel login is done", req.name);
+            return;
+        }
+        self.launch_request = None;
+        let item = Item {
+            id: req.id,
+            name: req.name,
+            ext: String::new(),
+            cat: String::new(),
+        };
+        self.status = format!("Opening {} from the guide", item.name);
+        // Through the normal path, so the pre-play guard still applies.
+        self.spawn_play(Kind::Live, item);
+    }
+
     /// The settings form itself, laid out in the docked panel.
     fn settings_body(&mut self, ui: &mut egui::Ui) {
         let m = egui::Margin::symmetric(6.0, 5.0);
@@ -1938,9 +1985,19 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
-        // Everything here is set once, so starting over has
-        // to be possible - and it means the local settings
-        // file, not just the fields on screen.
+        // Diagnostics for the one failure mode that is invisible otherwise:
+        // clicking a listing and nothing happening.
+        let (colour, text) = if launch::scheme_is_registered() {
+            (T_SUCCESS, "TV guide links are registered (eagleglass://)")
+        } else {
+            (T_DANGER, "TV guide links are NOT registered")
+        };
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(r.center(), 4.0, colour);
+            ui.add(egui::Label::new(egui::RichText::new(text).size(10.5).color(T_MUTED)));
+        });
+        ui.add_space(6.0);
         if self.confirm_reset {
             ui.label(
                 egui::RichText::new(
@@ -2012,14 +2069,16 @@ impl eframe::App for App {
         self.presence_sync();
         self.persist_volume(ctx);
         self.persist_picture(ctx);
+        self.poll_launch_request(ctx);
         self.detect_drop();
         self.check_stream_drop();
 
         if self.player.is_playing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(25));
-        } else if self.presence_ready() {
-            // Idle the UI is not repainted by egui, but the presence pill still
-            // needs to refresh when someone else starts watching.
+        } else {
+            // Even idle, keep one tick a second so a request from the guide page
+            // is noticed promptly. Idle egui repaints on demand only, so without
+            // this a click in the browser could sit unseen indefinitely.
             ctx.request_repaint_after(std::time::Duration::from_millis(1000));
         }
 
@@ -3139,6 +3198,39 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (server, user, pass, rest) = parse_flags(&args);
 
+    // A link from the TV guide page arrives as eagleglass://play?id=...
+    let link = rest.iter().find_map(|a| launch::parse_uri(a));
+
+    if link.is_some() || rest.is_empty() {
+        // Only the GUI takes part in the single-instance dance. CLI use must stay
+        // scriptable, so `eglass.exe presence` never hands off and never exits
+        // early.
+        if !launch::claim_single_instance() {
+            let outcome = match &link {
+                Some(req) => launch::send(&launch::Request::Play(req.clone())),
+                // A plain second launch: bring the existing window forward
+                // instead of leaving the user with nothing happening.
+                None => launch::send(&launch::Request::Focus),
+            };
+            match outcome {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("could not reach the running instance: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if let Some(req) = link {
+            if let Ok(mut slot) = startup_request().lock() {
+                *slot = Some(req);
+            }
+        }
+        // Writes HKCU\Software\Classes\eagleglass so browsers can reach us.
+        if let Err(e) = launch::register_uri_scheme() {
+            eprintln!("could not register the eagleglass:// link: {e}");
+        }
+    }
+
     if !rest.is_empty() {
         if let Err(e) = run_cli(server, user, pass, rest) {
             eprintln!("error: {}", e);
@@ -3163,4 +3255,11 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::default()))
         }),
     )
+}
+
+/// A channel the guide page asked us to open, handed over from the command line
+/// into `App::default` without threading it through every constructor.
+fn startup_request() -> &'static Mutex<Option<launch::PlayRequest>> {
+    static SLOT: std::sync::OnceLock<Mutex<Option<launch::PlayRequest>>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
 }
