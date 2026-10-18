@@ -77,6 +77,9 @@ fn load_config() -> Config {
         Ok(t) => t,
         Err(_) => return cfg,
     };
+    // A UTF-8 BOM would otherwise become part of the first key, silently
+    // dropping that setting. Notepad writes one, so this is not hypothetical.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     for line in text.lines() {
         let mut it = line.splitn(2, '=');
         let (key, value) = match (it.next(), it.next()) {
@@ -617,6 +620,8 @@ struct App {
     /// of the file when we save.
     file_cfg: Config,
     env: EnvOverrides,
+    /// The profile as last written to disk, so a change is saved once.
+    persisted_profile: String,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -702,6 +707,7 @@ impl Default for App {
         } else {
             cfg.device_id.clone()
         };
+        let persisted_profile = cfg.profile.clone();
         let file_cfg = cfg;
 
         let autostart = !user.is_empty() && !pass.is_empty();
@@ -771,6 +777,7 @@ impl Default for App {
             drop_at: 0,
             file_cfg,
             env: overrides,
+            persisted_profile,
         }
     }
 }
@@ -1003,6 +1010,30 @@ impl App {
     fn presence_sync(&mut self) {
         let state = if self.player.is_playing() { "playing" } else { "paused" };
         let id = self.profile_id();
+
+        // Picking a name is a choice worth keeping. Without this, choosing it
+        // from the top bar leaves presence working for that session only - and
+        // the file is otherwise only written on a successful login or when the
+        // settings dialog is used, neither of which a pre-configured install
+        // goes through.
+        if self.profile != self.persisted_profile {
+            self.persisted_profile = self.profile.clone();
+            save_config(&self.config_snapshot());
+        }
+
+        // The worker owns the friend group, so its list wins. Without this the
+        // dropdown was always the built-in four and adding a friend would have
+        // needed a new exe, which is not what the README claimed.
+        let worker_profiles = self
+            .roster
+            .lock()
+            .ok()
+            .map(|r| r.profiles.clone())
+            .unwrap_or_default();
+        if !worker_profiles.is_empty() && worker_profiles != self.profiles {
+            self.profiles = worker_profiles;
+        }
+
         if !self.reported_profile.is_empty() && self.reported_profile != id {
             if let Ok(mut g) = self.shared.lock() {
                 g.stale_profile = self.reported_profile.clone();
@@ -2036,6 +2067,10 @@ fn run_cli(server: String, user: String, pass: String, rest: Vec<String>) -> Res
     if cmd == "presence" {
         return presence_cli(rest.get(1).map(|s| s.as_str()));
     }
+    // Setting a name is likewise about the worker, not the panel.
+    if cmd == "profile" {
+        return set_profile(rest.get(1).map(|s| s.as_str()));
+    }
 
     let client = Xtream::new(&server, &user, &pass)?;
     match cmd {
@@ -2087,7 +2122,64 @@ fn run_cli(server: String, user: String, pass: String, rest: Vec<String>) -> Res
     Ok(())
 }
 
-/// `eglass.exe presence [watch|stop]` - check the shared roster without the GUI,
+/// The names the worker knows about, falling back to the built-in four when the
+/// worker cannot be reached.
+fn known_profiles(cfg: &Config) -> Vec<String> {
+    if !cfg.presence_url.is_empty() && !cfg.presence_token.is_empty() {
+        if let Ok(list) =
+            presence::Presence::new(&cfg.presence_url, &cfg.presence_token).profiles()
+        {
+            if !list.is_empty() {
+                return list.into_iter().map(|(_, name)| name).collect();
+            }
+        }
+    }
+    presence::DEFAULT_PROFILES
+        .iter()
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+/// `eglass.exe profile Blain`
+///
+/// Setting up a friend's machine should not depend on them finding the right
+/// dropdown, so the name can be set from a script - and it is the only setting
+/// that differs between friends, since the panel and presence credentials are
+/// shared.
+fn set_profile(name: Option<&str>) -> Result<(), String> {
+    let mut cfg = load_config();
+    let known = known_profiles(&cfg);
+
+    let name = match name {
+        Some(n) => n,
+        None => {
+            return Err(format!(
+                "usage: eglass.exe profile <name>\n  known: {}\n  currently: {}",
+                known.join(", "),
+                if cfg.profile.is_empty() { "(not set)" } else { &cfg.profile }
+            ))
+        }
+    };
+
+    let canonical = known
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("unknown name '{}'. known: {}", name, known.join(", ")))?;
+
+    cfg.profile = canonical.clone();
+    if cfg.device_id.is_empty() {
+        cfg.device_id = presence::new_device_id();
+    }
+    save_config(&cfg);
+    println!(
+        "{} now watches as {}",
+        presence::device_name(),
+        canonical
+    );
+    Ok(())
+}
+
+/// `eglass.exe presence [watch|stop|guard]` - check the shared roster without the GUI,
 /// and the quickest way to prove the worker is reachable.
 fn presence_cli(action: Option<&str>) -> Result<(), String> {
     let mut cfg = load_config();
@@ -2229,10 +2321,9 @@ fn print_roster(r: &Roster, me: &str) {
         "connection limit not reported".to_string()
     };
     println!(
-        "{} · {} device(s) · {} watching",
+        "{} · {} watching",
         account,
-        r.watchers.len(),
-        r.people()
+        r.watchers.len()
     );
     if r.unaccounted > 0 {
         println!(
