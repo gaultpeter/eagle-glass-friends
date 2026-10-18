@@ -16,11 +16,63 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Strip the panel password out of anything on its way to the status bar or a
+/// log line. Every Xtream request URL carries it in the query string, and ureq
+/// echoes that URL inside its own transport errors, so this has to clean the
+/// whole message rather than just the part we formatted.
+fn redact(s: &str) -> String {
+    const KEY: &str = "password=";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(KEY) {
+        out.push_str(&rest[..pos]);
+        out.push_str("password=<redacted>");
+        let after = &rest[pos + KEY.len()..];
+        let end = after
+            .find(|c: char| c == '&' || c == ' ' || c == '\n' || c == '\t')
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn field(v: &Value, key: &str) -> String {
     match v.get(key) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string().trim_matches('"').to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn password_is_stripped_from_error_text() {
+        // Shaped like ureq's real output: the URL appears twice, and the second
+        // copy is inside the transport error rather than our own formatting.
+        let msg = "Request failed for http://panel:8080/player_api.php?username=bob&password=hunter2&action=x: \
+                   http://panel:8080/player_api.php?username=bob&password=hunter2: Connection refused";
+        let out = redact(msg);
+        assert!(!out.contains("hunter2"), "password leaked: {}", out);
+        assert_eq!(out.matches("password=<redacted>").count(), 2);
+        // Everything else must survive, or the message stops being useful.
+        assert!(out.contains("panel:8080"));
+        assert!(out.contains("Connection refused"));
+        assert!(out.contains("action=x"));
+    }
+
+    #[test]
+    fn redact_leaves_clean_text_alone() {
+        assert_eq!(redact("Login rejected (auth=0)"), "Login rejected (auth=0)");
+        assert_eq!(redact(""), "");
+    }
+
+    #[test]
+    fn redact_handles_a_password_at_the_very_end() {
+        assert_eq!(redact("password=abc"), "password=<redacted>");
     }
 }
 
@@ -111,7 +163,7 @@ impl Xtream {
             .get(url)
             .set("User-Agent", USER_AGENT)
             .call()
-            .map_err(|e| format!("Request failed for {}: {}", url, e))?;
+            .map_err(|e| redact(&format!("Request failed for {}: {}", url, e)))?;
         let mut text = String::new();
         resp.into_reader()
             .read_to_string(&mut text)

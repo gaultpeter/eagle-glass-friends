@@ -244,6 +244,13 @@ impl Presence {
     }
 }
 
+/// `active_cons` / `max_connections` out of a `player_api.php` `user_info`
+/// blob. This is the authoritative answer to "is the line free?" - the roster
+/// only says *who*, the panel says *whether*.
+pub fn account_counts(user_info: &Value) -> (i64, i64) {
+    (int_at(user_info, "active_cons"), int_at(user_info, "max_connections"))
+}
+
 fn short(s: &str) -> String {
     let cut = s.split('\n').next().unwrap_or(s).trim();
     if cut.len() > 120 {

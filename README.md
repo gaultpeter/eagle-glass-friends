@@ -93,24 +93,55 @@ Output: `target\release\eglass.exe`
 
 ## Presence (who else is watching)
 
-Four people sharing one Xtream line means somebody eventually gets kicked because the connection
-limit is reached. The panel will not tell you who is on - its public API (`player_api.php`) only
-reports a **count** of live connections, never who or what. So this build asks each other instead.
+Four people sharing one Xtream line, and the line allows **one connection at a time**, means somebody
+eventually gets kicked mid-match. The panel will not tell you who is on - its public API
+(`player_api.php`) only reports a **count** of live connections, never who or what. So this build asks
+each other instead.
 
-Set your name once in the wizard, and:
+### The guard
 
-- The **top bar** shows a pill: `Only you · 2/4`, `2 watching · Blain, Johnny`, or
-  `1 unknown watcher`.
-- **Hover** it for each friend's channel, how long they've been on, and their device.
-- **Click** it (or *Settings -> Open dashboard*) for the phone dashboard.
+The important part is not the pill, it is what happens when you press play.
 
-While a stream is up the app heartbeats the worker every 60s. Every heartbeat also carries the
-`active_cons` / `max_connections` counters from the app's own login call, which is what makes the
-**unknown watcher** case detectable: if the panel reports more live connections than there are
-checked-in devices, someone outside the group is watching.
+If you are **not already watching**, the app asks the panel for `active_cons` (the authority on whether
+the line is free) and the worker for the roster (the authority on *who*). Then:
 
-A paused stream still holds a panel connection, so pausing keeps you on the roster. Presence clears
-when you exit, and self-expires on the worker within ~3 minutes if the app is killed.
+| Panel says | You see |
+|---|---|
+| Free | Nothing. The stream just starts - the common case stays zero-friction. |
+| Busy, a friend is on | *"Blain is watching Sky Sports Main Event · 38m in. This line allows 1 connection. Starting will kick them off."* with **Cancel** / **Take the line**. |
+| Busy, nobody checked in | *"Someone is watching that we can't identify."* |
+| Busy, only your own other device | *"You're already watching on another device."* |
+
+Once a stream is up you hold the connection, so zapping channels never re-prompts.
+
+If the worker is unreachable the panel still knows the line is busy, so you get the warning without a
+name rather than nothing at all.
+
+### The pill
+
+The top bar answers "can I watch, and if not, who has it" - not "how many connections are in use",
+which on a one-connection line is true whenever you are happily watching your own channel.
+
+| | |
+|---|---|
+| `Line free` | green - nobody is on the account |
+| `Blain · Sky Sports F1` | who has it, and what they are watching |
+| `Line in use · unknown` | the panel counts a connection that no client of ours claims |
+| `Conflict · Blain also on` | two of us on a one-connection line - one is about to be cut |
+| `Line is yours` | green - you are the one watching |
+
+Hover for each friend's channel, how long they've been on, and their device. Click for the phone
+dashboard.
+
+### Being kicked off
+
+If your stream stops and you did not pause it, the app asks for a fresh roster and tells you who took
+the line: *"Blain took the line - now on Sky Sports Main Event"*. It would be poor form to let your
+stream die unexplained. A pause is treated as deliberate, so pausing never triggers this.
+
+While a stream is up the app heartbeats the worker every 60s. A paused stream still holds a panel
+connection, so pausing keeps you on the roster. Presence clears when you exit, and self-expires on the
+worker within ~3 minutes if the app is killed.
 
 ### Setup
 
@@ -182,9 +213,14 @@ control bar sits directly beneath the video, and the settings dialog temporarily
 - **Presence is cooperative and advisory.** It knows only about people running this build. The token is
   compiled into the exe and can be extracted by whoever holds it - the worker validates profile names
   server-side, so nobody can forge a *name* into the roster, but they could forge a heartbeat.
-  The unknown-watcher warning is the backstop.
+  The unaccounted-watcher warning is the backstop.
+- **The guard cannot eliminate the race.** If you and Blain press play within a few seconds of each
+  other, you both see "free" and one of you gets cut. A short claim on the worker would shrink that
+  window but not close it.
 - The roster refreshes every 20s while you are watching and every 60s while idle; heartbeats are
   written every 60s to stay inside Cloudflare KV's free write allowance.
+- `cargo test` covers the guard's decision logic and the pill's wording, including the one-connection
+  cases - those are pure functions precisely so they can be tested without a window or a panel.
 
 ## License
 
