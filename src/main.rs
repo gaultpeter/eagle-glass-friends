@@ -2156,9 +2156,12 @@ impl eframe::App for App {
             self.set_fullscreen(ctx, true);
         }
         // The guard dialog sits over the video surface, which egui cannot paint
-        // on top of, so shrink the video away while it is up - same trick the
-        // settings dialog uses.
-        if self.show_settings || self.pending_play.is_some() {
+        // on top of, so shrink the video away while it is up. Nothing is playing
+        // at that point, so there is nothing to interrupt.
+        //
+        // Settings deliberately does NOT do this any more: it is a docked panel,
+        // so the video rectangle just gets narrower and keeps playing.
+        if self.pending_play.is_some() {
             self.player.set_bounds(0.0, 0.0, 1.0, 1.0);
         } else if let Some(rect) = video_rect {
             self.apply_bounds(ctx, rect);
