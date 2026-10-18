@@ -151,14 +151,6 @@ impl Roster {
         self.fetched_at > 0
     }
 
-    /// Count of distinct people (a person may be on more than one device).
-    pub fn people(&self) -> usize {
-        let mut seen: Vec<&str> = self.watchers.iter().map(|w| w.profile.as_str()).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        seen.len()
-    }
-
     /// Everyone in the roster who is not us.
     pub fn others(&self, me: &str) -> Vec<&Watcher> {
         self.watchers.iter().filter(|w| w.profile != me).collect()
