@@ -25,6 +25,9 @@ use std::path::PathBuf;
 pub struct PlayRequest {
     pub id: String,
     pub name: String,
+    /// The panel's category id, when the link knows it. Optional: an older link,
+    /// or one typed by hand, simply will not move the sidebar.
+    pub cat: Option<String>,
 }
 
 /// What the running instance has been asked to do.
@@ -63,6 +66,7 @@ pub fn parse_uri(arg: &str) -> Option<PlayRequest> {
 
     let mut id = String::new();
     let mut name = String::new();
+    let mut cat = String::new();
     for pair in query.split('&') {
         let (k, v) = match pair.split_once('=') {
             Some(kv) => kv,
@@ -72,6 +76,9 @@ pub fn parse_uri(arg: &str) -> Option<PlayRequest> {
         match percent_decode(k).to_ascii_lowercase().as_str() {
             "id" => id = value,
             "name" => name = value,
+            // A category id is numeric on every Xtream panel; anything else is
+            // not passed on.
+            "cat" if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) => cat = value,
             _ => {}
         }
     }
@@ -84,7 +91,11 @@ pub fn parse_uri(arg: &str) -> Option<PlayRequest> {
     } else {
         name.trim().to_string()
     };
-    Some(PlayRequest { id, name })
+    Some(PlayRequest {
+        id,
+        name,
+        cat: if cat.is_empty() { None } else { Some(cat) },
+    })
 }
 
 /// Percent-decoding, plus `+` as space, which is what a form-style query uses.
@@ -130,7 +141,7 @@ fn request_path() -> PathBuf {
 pub fn send(req: &Request) -> std::io::Result<()> {
     let body = match req {
         Request::Focus => json!({ "kind": "focus" }),
-        Request::Play(p) => json!({ "kind": "play", "id": p.id, "name": p.name }),
+        Request::Play(p) => json!({ "kind": "play", "id": p.id, "name": p.name, "cat": p.cat }),
     };
     std::fs::write(request_path(), body.to_string())
 }
@@ -156,7 +167,13 @@ pub fn take() -> Option<Request> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(Request::Play(PlayRequest { id, name }))
+            // A category that is not a plain number is not one of ours.
+            let cat = value
+                .get("cat")
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()))
+                .map(|c| c.to_string());
+            Some(Request::Play(PlayRequest { id, name, cat }))
         }
         _ => None,
     }
@@ -326,6 +343,29 @@ mod tests {
         let r = parse_uri("eagleglass://play?id=91202&name=Sky%20Sports%20Main%20Event").unwrap();
         assert_eq!(r.id, "91202");
         assert_eq!(r.name, "Sky Sports Main Event");
+        assert_eq!(r.cat, None);
+    }
+
+    #[test]
+    fn a_link_can_carry_the_category_so_the_sidebar_can_follow() {
+        let r = parse_uri("eagleglass://play?id=91202&name=Sky&cat=17").unwrap();
+        assert_eq!(r.cat.as_deref(), Some("17"));
+    }
+
+    // The exact shape the guide page builds, including an encoded name.
+    #[test]
+    fn the_link_the_page_actually_sends() {
+        let r = parse_uri("eagleglass://play?id=81564&name=AUS%3A%20FOX%20SPORTS%20501&cat=83").unwrap();
+        assert_eq!(r.id, "81564");
+        assert_eq!(r.name, "AUS: FOX SPORTS 501");
+        assert_eq!(r.cat.as_deref(), Some("83"));
+    }
+
+    #[test]
+    fn a_junk_category_is_ignored_rather_than_passed_on() {
+        assert_eq!(parse_uri("eagleglass://play?id=5&cat=../../etc").unwrap().cat, None);
+        assert_eq!(parse_uri("eagleglass://play?id=5&cat=").unwrap().cat, None);
+        assert_eq!(parse_uri("eagleglass://play?id=5&cat=abc").unwrap().cat, None);
     }
 
     #[test]
@@ -386,7 +426,7 @@ mod tests {
         let path = request_path();
         let _ = std::fs::remove_file(&path);
 
-        let want = PlayRequest { id: "91202".into(), name: "Sky Sports".into() };
+        let want = PlayRequest { id: "91202".into(), name: "Sky Sports".into(), cat: Some("17".into()) };
         send(&Request::Play(want.clone())).unwrap();
         match take() {
             Some(Request::Play(got)) => assert_eq!(got, want),

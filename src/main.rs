@@ -384,7 +384,8 @@ fn cat_node(ui: &mut egui::Ui, expanded: bool, selected: bool, label: &str, coun
     resp.clicked()
 }
 
-fn side_chan(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+/// A channel row, with the response so the caller can scroll it into view.
+fn side_chan(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
     if selected {
         ui.painter().rect_filled(rect, 5.0, T_ACCENT_SOFT);
@@ -406,7 +407,7 @@ fn side_chan(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
         font,
         color,
     );
-    resp.clicked()
+    resp
 }
 
 fn live_badge(ui: &mut egui::Ui, a: f32) {
@@ -743,6 +744,14 @@ struct App {
     /// A channel the TV guide asked for, waiting until we can play it.
     launch_request: Option<launch::PlayRequest>,
     request_poll_at: i64,
+    /// A launched channel's category, applied once the play is in flight - the
+    /// app has a single receiver for background work, so the two steps have to
+    /// take turns.
+    pending_sidebar: Option<(String, String)>,
+    /// The channel to highlight once its category's list has loaded.
+    pending_select: Option<String>,
+    /// One-shot: scroll the highlighted row into view.
+    scroll_to_selected: bool,
 }
 
 fn clone_client(c: &Option<Xtream>) -> Option<Xtream> {
@@ -916,6 +925,9 @@ impl Default for App {
             // Whatever the guide page asked for before we were even running.
             launch_request: startup_request().lock().ok().and_then(|mut s| s.take()),
             request_poll_at: 0,
+            pending_sidebar: None,
+            pending_select: None,
+            scroll_to_selected: false,
         }
     }
 }
@@ -1050,6 +1062,14 @@ impl App {
                 self.status = format!("{} item(s)", items.len());
                 self.items = items;
                 self.selected = None;
+                // A channel launched from the guide gets highlighted, and the
+                // list scrolled to it - a category can hold eighty rows.
+                if let Some(id) = self.pending_select.take() {
+                    if let Some(i) = self.items.iter().position(|it| it.id == id) {
+                        self.selected = Some(i);
+                        self.scroll_to_selected = true;
+                    }
+                }
                 if let Some(id) = self.autoplay.take() {
                     if let Some(i) = self.items.iter().position(|it| it.id == id) {
                         let kind = self.kind;
@@ -1811,14 +1831,51 @@ impl App {
         }
         self.launch_request = None;
         let item = Item {
-            id: req.id,
-            name: req.name,
+            id: req.id.clone(),
+            name: req.name.clone(),
             ext: String::new(),
             cat: String::new(),
         };
         self.status = format!("Opening {} from the guide", item.name);
-        // Through the normal path, so the pre-play guard still applies.
+        // Play first - that is what the click asked for - and follow it in the
+        // sidebar afterwards.
         self.spawn_play(Kind::Live, item);
+        if let Some(cat) = req.cat.clone() {
+            self.pending_sidebar = Some((cat, req.id.clone()));
+        } else if self.kind == Kind::Live {
+            // No category in the link, but if it is already on screen we can
+            // still highlight it when the list settles.
+            if self.items.iter().any(|it| it.id == req.id) {
+                self.pending_select = Some(req.id.clone());
+            }
+        }
+    }
+
+    /// Show the launched channel in the sidebar: open its category, load it, and
+    /// highlight the row. One step at a time, because only one background job can
+    /// be in flight.
+    fn follow_launch_in_sidebar(&mut self) {
+        if self.rx.is_some() || self.pending_sidebar.is_none() {
+            return;
+        }
+        let Some((cat, id)) = self.pending_sidebar.take() else {
+            return;
+        };
+        // The category has to exist in the catalogue we were given.
+        let known = self
+            .cats
+            .iter()
+            .any(|c| c.kind == Kind::Live && c.id == cat);
+        if !known {
+            return;
+        }
+        self.kind = Kind::Live;
+        self.open_live = true;
+        self.open_cats.insert(cat.clone());
+        self.cat = Some(cat.clone());
+        self.pending_select = Some(id);
+        self.width_applied = false;
+        self.spawn_items(Kind::Live, Some(cat));
     }
 
     /// The settings form itself, laid out in the docked panel.
@@ -2070,6 +2127,7 @@ impl eframe::App for App {
         self.persist_volume(ctx);
         self.persist_picture(ctx);
         self.poll_launch_request(ctx);
+        self.follow_launch_in_sidebar();
         self.detect_drop();
         self.check_stream_drop();
 
@@ -2211,6 +2269,7 @@ impl eframe::App for App {
         let side_w = self.side_width.unwrap_or(280.0);
         let apply_exact = !self.width_applied && self.side_width.is_some();
         let mut open_cats = std::mem::take(&mut self.open_cats);
+        let scroll_to = std::mem::take(&mut self.scroll_to_selected);
         {
             let cats = &self.cats;
             let items = &self.items;
@@ -2272,7 +2331,11 @@ impl eframe::App for App {
                                         if it.cat != r.id {
                                             continue;
                                         }
-                                        if side_chan(ui, selected == Some(idx), &it.name) {
+                                        let row = side_chan(ui, selected == Some(idx), &it.name);
+                                        if selected == Some(idx) && scroll_to {
+                                            row.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if row.clicked() {
                                             play_side = Some((*kind, idx, it.clone()));
                                         }
                                     }
@@ -3200,8 +3263,9 @@ fn main() -> eframe::Result<()> {
 
     // A link from the TV guide page arrives as eagleglass://play?id=...
     let link = rest.iter().find_map(|a| launch::parse_uri(a));
+    let launching = link.is_some();
 
-    if link.is_some() || rest.is_empty() {
+    if launching || rest.is_empty() {
         // Only the GUI takes part in the single-instance dance. CLI use must stay
         // scriptable, so `eglass.exe presence` never hands off and never exits
         // early.
@@ -3231,7 +3295,10 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    if !rest.is_empty() {
+    // The link is the only thing in `rest`, and it has been dealt with - so it
+    // must not fall through into CLI mode. That path made a first click, with the
+    // app not yet running, print "unknown command" and exit without a window.
+    if !rest.is_empty() && !launching {
         if let Err(e) = run_cli(server, user, pass, rest) {
             eprintln!("error: {}", e);
             std::process::exit(1);
