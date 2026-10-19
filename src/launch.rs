@@ -334,6 +334,18 @@ mod win {
     }
 }
 
+/// Serialises the tests that touch the hand-over file.
+///
+/// That file has a fixed path, and a test that drives a real `App` has to
+/// redirect the whole environment to keep away from the user's settings - which
+/// also moves this file. Anything that both writes and reads it in one test has
+/// to hold this, or a parallel test can read the file out from under it.
+#[cfg(test)]
+pub fn test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,9 +432,11 @@ mod tests {
     }
 
     // The hand-over file has a fixed path, so everything that touches it lives in
-    // one test - Rust runs tests in parallel and they would otherwise race.
+    // one test - Rust runs tests in parallel and they would otherwise race. The
+    // lock is held because another test redirects the environment underneath it.
     #[test]
     fn the_handover_file_behaves() {
+        let _serial = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let path = request_path();
         let _ = std::fs::remove_file(&path);
 

@@ -1851,9 +1851,10 @@ impl App {
         }
     }
 
-    /// Show the launched channel in the sidebar: open its category, load it, and
-    /// highlight the row. One step at a time, because only one background job can
-    /// be in flight.
+    /// Show the launched channel in the sidebar: open its category and highlight
+    /// the row. The sidebar is built from the complete live list, so that list is
+    /// what gets loaded - fetching only the linked category would leave every
+    /// other category empty and make switching impossible.
     fn follow_launch_in_sidebar(&mut self) {
         if self.rx.is_some() || self.pending_sidebar.is_none() {
             return;
@@ -1869,13 +1870,22 @@ impl App {
         if !known {
             return;
         }
+        // One step at a time, because only one background job can be in flight.
+        let have_live = self.kind == Kind::Live && !self.items.is_empty();
         self.kind = Kind::Live;
         self.open_live = true;
         self.open_cats.insert(cat.clone());
-        self.cat = Some(cat.clone());
-        self.pending_select = Some(id);
+        self.cat = Some(cat);
         self.width_applied = false;
-        self.spawn_items(Kind::Live, Some(cat));
+        if have_live {
+            if let Some(i) = self.items.iter().position(|it| it.id == id) {
+                self.selected = Some(i);
+                self.scroll_to_selected = true;
+            }
+        } else {
+            self.pending_select = Some(id);
+            self.spawn_items(Kind::Live, None);
+        }
     }
 
     /// The settings form itself, laid out in the docked panel.
@@ -3233,6 +3243,213 @@ mod tests {
     fn guard_still_warns_when_it_can_name_someone() {
         let r = roster(1, 1, vec![watcher("blain", "Blain", F1, 60)]);
         assert!(warned(&decide_guard(1, 1, Some(&r), "peter")).is_some());
+    }
+
+    /* ------------------------------ a launch from the guide, from cold ---- */
+
+    /// A panel that answers just enough of the Xtream API for a login, a
+    /// category list and two category listings. Its thread ends with the
+    /// process, which is fine for a test binary.
+    fn fake_panel() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        const LOGIN: &str = r#"{"user_info":{"username":"tester","status":"Active","auth":1,"exp_date":"1893456000","max_connections":"1"}}"#;
+        const CATS: &str = r#"[{"category_id":"10","category_name":"UK Sport"},{"category_id":"11","category_name":"News"}]"#;
+        const ALL: &str = r#"[{"stream_id":"1","name":"Sky Sports F1","category_id":"10"},{"stream_id":"2","name":"Sky Sports Main Event","category_id":"10"},{"stream_id":"3","name":"BBC News","category_id":"11"}]"#;
+        const CAT10: &str = r#"[{"stream_id":"1","name":"Sky Sports F1","category_id":"10"},{"stream_id":"2","name":"Sky Sports Main Event","category_id":"10"}]"#;
+        const CAT11: &str = r#"[{"stream_id":"3","name":"BBC News","category_id":"11"}]"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a fake panel");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let Ok(dup) = sock.try_clone() else { continue };
+                let mut reader = BufReader::new(dup);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                // Drain the headers; ureq sends no body.
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                        break;
+                    }
+                }
+                let target = request_line.split_whitespace().nth(1).unwrap_or("/");
+                let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+                let arg = |key: &str| -> String {
+                    query
+                        .split('&')
+                        .filter_map(|p| p.split_once('='))
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_default()
+                };
+                let body = match arg("action").as_str() {
+                    "get_live_categories" => CATS,
+                    "get_live_streams" => match arg("category_id").as_str() {
+                        "10" => CAT10,
+                        "11" => CAT11,
+                        _ => ALL,
+                    },
+                    "get_vod_categories" | "get_series_categories" => "[]",
+                    // No action is the login itself.
+                    _ => LOGIN,
+                };
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Point config, the hand-over file and anything else read through the
+    /// environment at a directory of our own, so a test can never see - or
+    /// overwrite - the real settings.
+    fn isolate(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("eglass-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("EagleGlass")).expect("make the test config dir");
+        std::env::set_var("APPDATA", &base);
+        std::env::set_var("TMP", &base);
+        std::env::set_var("TEMP", &base);
+        base
+    }
+
+    /// Run the frame loop in the order `update` runs it, keeping a trace so a
+    /// failure reports what happened rather than only that it did not.
+    fn drive(app: &mut App, done: impl Fn(&App) -> bool, max_frames: usize) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut trace = Vec::new();
+        for n in 0..max_frames {
+            app.pump();
+            app.poll_launch_request(&ctx);
+            app.follow_launch_in_sidebar();
+            trace.push(format!(
+                "  frame {n:>3}: cats={} items={} cat={:?} busy={} sel={:?} status={:?}",
+                app.cats.len(),
+                app.items.len(),
+                app.cat,
+                app.rx.is_some(),
+                app.selected,
+                app.status
+            ));
+            if done(app) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        trace
+    }
+
+    /// The reported bug: clicking a channel in the guide with the app *not*
+    /// running started playback but left the sidebar empty.
+    ///
+    /// Cold, the login and the launch land in the same frame. The login starts
+    /// the channel list and the launch immediately claims the single background
+    /// slot for its play job, so the list job's answer is sent to a channel
+    /// nobody is reading. The sidebar then has categories but nothing to put
+    /// under them.
+    #[test]
+    fn a_cold_launch_from_the_guide_fills_the_sidebar() {
+        let _serial = launch::test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let panel = fake_panel();
+        let dir = isolate("cold-launch");
+        std::fs::write(
+            dir.join("EagleGlass").join("config.txt"),
+            format!("server={panel}\nuser=tester\npass=secret\nprofile=\n"),
+        )
+        .expect("write the test config");
+
+        let mut app = App::default();
+        assert!(app.autostart, "the test config should be enough to log in");
+        // What main() does with the link when this instance is the first one.
+        app.launch_request = Some(launch::PlayRequest {
+            id: "2".into(),
+            name: "Sky Sports Main Event".into(),
+            cat: Some("10".into()),
+        });
+        app.spawn_login();
+
+        let trace = drive(&mut app, |a| a.items.len() >= 2, 400);
+        let when = || trace.join("\n");
+
+        assert!(
+            app.cats.iter().any(|c| c.kind == Kind::Live && c.id == "10"),
+            "the live categories never arrived:\n{}",
+            when()
+        );
+        assert_eq!(
+            app.cat.as_deref(),
+            Some("10"),
+            "the sidebar did not open the launched channel's category:\n{}",
+            when()
+        );
+        assert!(
+            !app.items.is_empty(),
+            "the sidebar has no channels in it:\n{}",
+            when()
+        );
+        assert_eq!(
+            app.items.len(),
+            3,
+            "the whole live catalogue should be loaded so other categories stay usable:\n{}",
+            when()
+        );
+        let at = app.selected.expect("the launched channel should be highlighted");
+        assert_eq!(app.items[at].id, "2", "the wrong row is highlighted:\n{}", when());
+        assert!(
+            app.open_cats.contains("10"),
+            "the category should be open so the row is visible:\n{}",
+            when()
+        );
+        assert!(
+            app.pending_select.is_none() && app.pending_sidebar.is_none(),
+            "the launch should be fully applied, not left half-done:\n{}",
+            when()
+        );
+    }
+
+    /// The same click against a window that is already up, which is the case
+    /// that was easy to get right - it is here so the cold case cannot regress
+    /// back by way of a "fix" to the warm one.
+    #[test]
+    fn a_launch_into_a_running_window_moves_the_sidebar() {
+        let _serial = launch::test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let panel = fake_panel();
+        let dir = isolate("warm-launch");
+        std::fs::write(
+            dir.join("EagleGlass").join("config.txt"),
+            format!("server={panel}\nuser=tester\npass=secret\nprofile=\n"),
+        )
+        .expect("write the test config");
+
+        let mut app = App::default();
+        app.spawn_login();
+        // Settle first: logged in, the default list loaded.
+        drive(&mut app, |a| a.client.is_some() && a.items.len() >= 3, 400);
+        assert_eq!(app.items.len(), 3, "expected the whole live list to load");
+
+        // Then the click arrives.
+        app.launch_request = Some(launch::PlayRequest {
+            id: "3".into(),
+            name: "BBC News".into(),
+            cat: Some("11".into()),
+        });
+        let trace = drive(&mut app, |a| a.cat.as_deref() == Some("11") && a.selected.is_some(), 400);
+
+        assert_eq!(app.cat.as_deref(), Some("11"), "wrong category:\n{}", trace.join("\n"));
+        assert_eq!(app.items.len(), 3, "the whole list should survive a launch:\n{}", trace.join("\n"));
+        let at = app.selected.expect("the launched channel should be highlighted");
+        assert_eq!(app.items[at].id, "3");
     }
 }
 
