@@ -1,0 +1,3 @@
+# Keep binary assets out of any line-ending conversion.
+*.ico binary
+*.png binary

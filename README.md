@@ -50,6 +50,18 @@ surface (video renders *inside* the app - no separate VLC window popping up).
 Grab `eglass.exe` from the [**Releases**](https://github.com/gaultpeter/eagle-glass-friends/releases/latest)
 page, or build it yourself below.
 
+> [!TIP]
+> Releases are built by GitHub Actions and published with a SHA-256 checksum. Check both before running:
+>
+> ```powershell
+> Get-FileHash .\eglass.exe -Algorithm SHA256
+> Get-AuthenticodeSignature .\eglass.exe | Select-Object Status, SignerCertificate
+> ```
+>
+> The hash must match `SHA256SUMS.txt` on the release page. See [docs/SIGNING.md](docs/SIGNING.md) for what the signature does and does not prove.
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). See [docs/SIGNING.md](docs/SIGNING.md) and [PRIVACY.md](PRIVACY.md).
+
 > [!IMPORTANT]
 > **64-bit VLC must be installed** (Eagle Glass loads `libvlc.dll` at runtime - it does not bundle it).
 > Install [VLC](https://www.videolan.org/vlc/) or point `EG_VLC_DIR` at a folder containing `libvlc.dll`.

@@ -3525,10 +3525,17 @@ fn main() -> eframe::Result<()> {
 
     detach_console();
 
+    // Taskbar/window icon. The exe carries the same artwork as a Win32
+    // resource (see build.rs); this is what winit hands to the window itself.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1600.0, 1030.0])
+        .with_min_inner_size([1000.0, 640.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1600.0, 1030.0])
-            .with_min_inner_size([1000.0, 640.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
