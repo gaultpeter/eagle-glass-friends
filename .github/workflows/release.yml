@@ -118,9 +118,9 @@ jobs:
         env:
           EXPECT_SIGNATURE: ${{ env.SIGN_SIGNPATH == 'true' || env.SIGN_AZURE == 'true' || env.SIGN_PFX == 'true' }}
         run: |
-          $verifyArgs = @('-Path', "dist/$env:BINARY", '-SumsPath', 'dist/SHA256SUMS.txt')
-          if ($env:EXPECT_SIGNATURE -eq 'true') { $verifyArgs += '-RequireSignature' }
-          ./scripts/verify-release.ps1 @verifyArgs
+          $verifyParams = @{ Path = "dist/$env:BINARY"; SumsPath = 'dist/SHA256SUMS.txt' }
+          if ($env:EXPECT_SIGNATURE -eq 'true') { $verifyParams.RequireSignature = $true }
+          ./scripts/verify-release.ps1 @verifyParams
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
